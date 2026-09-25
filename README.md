@@ -35,6 +35,15 @@ also store the key passphrase, encrypted via your OS keychain (`safeStorage`).
 - Toolbar: new folder, rename (F2), delete (Del), refresh, up
 - The bottom queue shows every transfer with progress; failed transfers don't block the rest
 
+### Droplet command line
+
+- Press **⌨ Terminal** (or `Ctrl+\``) while connected to open a shell drawer on the same SSH
+  connection — file transfers keep working alongside it
+- Real xterm.js terminal: colors, tab completion, shell history, and TUI programs (`vim`, `htop`)
+- Drag the drawer's top edge to resize; every resize is sent to the remote PTY (`window-change`),
+  so full-screen programs reflow correctly
+- Scrollback survives hiding the drawer; the session closes when you disconnect
+
 ## Scripts
 
 | Command             | What it does                                        |
@@ -42,7 +51,9 @@ also store the key passphrase, encrypted via your OS keychain (`safeStorage`).
 | `npm run dev`       | Start with hot reload (devtools attached)           |
 | `npm run build`     | Production bundle in `out/`                         |
 | `npm run typecheck` | Type-check main, preload, and renderer              |
-| `npm test`          | Loopback E2E test against an in-memory SFTP server  |
+| `npm test`          | SSH/SFTP loopback tests and renderer behavior tests  |
+| `npm run dist`     | Windows NSIS installer in `dist/` (`Droplet Files Setup X.Y.Z.exe`) |
+| `npm run dist:dir`  | Unpacked Windows build in `dist/win-unpacked/` (fast smoke test)    |
 
 ## Architecture
 
@@ -54,7 +65,7 @@ src/
 │   ├── ipc.ts            typed IPC handlers (channels in src/shared/channels.ts)
 │   └── store.ts          profiles + trusted host fingerprints (userData JSON, safeStorage)
 ├── preload/index.ts      contextBridge → window.api (no Node access in the renderer)
-├── renderer/             React UI (two panes, connection bar, transfer queue, dialogs)
+├── renderer/             React UI (two panes, connection bar, terminal drawer, transfer queue, dialogs)
 ├── shared/types.ts       IPC contract shared by both sides
 └── scripts/e2e.mjs       end-to-end test: real SshManager ↔ loopback ssh2 server
 ```
@@ -68,4 +79,4 @@ the OS keychain, private keys read only in the main process.
 - One droplet connection at a time
 - No folder sync or remote file editing yet
 - Dropping onto a specific subfolder uploads to the pane's current folder instead
-- Not packaged as an installer yet (`electron-builder` can be added when needed)
+- Unsigned Windows installer triggers a SmartScreen prompt until the binary is code-signed

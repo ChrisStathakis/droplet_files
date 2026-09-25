@@ -31,6 +31,13 @@ const api: ElectronApi = {
   download: (remotePaths, localDir) => ipcRenderer.invoke(CH.download, remotePaths, localDir),
   onTransfer: onEvent(CH.transferUpdate),
 
+  shellOpen: (options) => ipcRenderer.invoke(CH.shellOpen, options),
+  shellWrite: (data) => ipcRenderer.invoke(CH.shellWrite, data),
+  shellResize: (cols, rows) => ipcRenderer.invoke(CH.shellResize, cols, rows),
+  shellClose: () => ipcRenderer.invoke(CH.shellClose),
+  onShellData: onEvent(CH.shellData),
+  onShellClosed: onEvent(CH.shellClosed),
+
   listProfiles: () => ipcRenderer.invoke(CH.profilesList),
   saveProfile: (profile, passphrase) => ipcRenderer.invoke(CH.profilesSave, profile, passphrase),
   deleteProfile: (id) => ipcRenderer.invoke(CH.profilesDelete, id),

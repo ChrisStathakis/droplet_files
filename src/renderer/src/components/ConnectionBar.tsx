@@ -26,6 +26,7 @@ interface Props {
   form: ConnectionForm
   selectedProfileId: string | null
   error: string | null
+  terminalOpen: boolean
   onFormChange: (patch: Partial<ConnectionForm>) => void
   onSelectProfile: (id: string | null) => void
   onConnect: () => void
@@ -33,6 +34,7 @@ interface Props {
   onSaveProfile: () => void
   onDeleteProfile: () => void
   onPickKey: () => void
+  onToggleTerminal: () => void
 }
 
 export function ConnectionBar({
@@ -41,13 +43,15 @@ export function ConnectionBar({
   form,
   selectedProfileId,
   error,
+  terminalOpen,
   onFormChange,
   onSelectProfile,
   onConnect,
   onDisconnect,
   onSaveProfile,
   onDeleteProfile,
-  onPickKey
+  onPickKey,
+  onToggleTerminal
 }: Props): React.ReactElement {
   const connected = status.state === 'connected'
   const busy = status.state === 'connecting'
@@ -90,6 +94,15 @@ export function ConnectionBar({
         </button>
 
         <div className="spacer" />
+
+        <button
+          className={`btn${terminalOpen ? ' btn-primary' : ''}`}
+          onClick={onToggleTerminal}
+          disabled={!connected}
+          title="Toggle the droplet terminal (Ctrl+`)"
+        >
+          ⌨ Terminal
+        </button>
 
         <span className={`status status-${status.state}`} title={status.message}>
           <span className="status-dot" />

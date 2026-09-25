@@ -191,6 +191,7 @@ var SshManager = class {
   }
   client = null;
   sftp = null;
+  shellStream = null;
   pendingHostKeys = /* @__PURE__ */ new Map();
   lock = Promise.resolve();
   transferSeq = 0;
@@ -281,6 +282,7 @@ var SshManager = class {
   }
   async disconnect() {
     this.rejectPendingHostKeys();
+    this.endShell();
     const client = this.client;
     this.client = null;
     this.sftp = null;
@@ -295,6 +297,7 @@ var SshManager = class {
   handleUnexpectedClose(message) {
     this.client = null;
     this.sftp = null;
+    this.endShell(message);
     this.rejectPendingHostKeys();
     this.setStatus("disconnected", message || void 0);
   }
@@ -335,6 +338,70 @@ var SshManager = class {
     });
     if (answer) Store.setTrustedFingerprint(hostPort, fingerprint);
     finish(answer);
+  }
+  // ---------------------------------------------------------------------- shell
+  /**
+   * Opens an interactive shell (PTY) on the existing connection.
+   * Any previous session is replaced silently — only the new stream emits events.
+   */
+  async openShell(options) {
+    const client = this.client;
+    if (!client || this.status.state !== "connected") {
+      throw new Error("Not connected to a server");
+    }
+    this.endShell(void 0, true);
+    const stream = await promisify(
+      (cb) => client.shell(
+        {
+          term: "xterm-256color",
+          cols: Math.max(2, Math.floor(options.cols)),
+          rows: Math.max(1, Math.floor(options.rows))
+        },
+        cb
+      )
+    );
+    this.shellStream = stream;
+    stream.setEncoding("utf8");
+    stream.stderr.setEncoding("utf8");
+    stream.on("data", (chunk) => {
+      if (this.shellStream === stream) this.events.shellData(chunk);
+    });
+    stream.stderr.on("data", (chunk) => {
+      if (this.shellStream === stream) this.events.shellData(chunk);
+    });
+    const finish = (reason) => {
+      if (this.shellStream !== stream) return;
+      this.shellStream = null;
+      this.events.shellClosed({ reason });
+    };
+    stream.on("error", (err) => finish(err.message));
+    stream.on("close", () => finish());
+  }
+  /** Sends keystrokes to the shell; ignored when no session is open */
+  writeShell(data) {
+    const stream = this.shellStream;
+    if (!stream) return;
+    stream.write(data);
+  }
+  /** Tells the remote PTY about a terminal resize; ignored when no session is open */
+  resizeShell(cols, rows) {
+    const stream = this.shellStream;
+    if (!stream) return;
+    stream.setWindow(Math.max(1, Math.floor(rows)), Math.max(2, Math.floor(cols)), 0, 0);
+  }
+  closeShell() {
+    this.endShell();
+  }
+  /** Ends the shell channel; `silent` skips the shellClosed event (session swap) */
+  endShell(reason, silent = false) {
+    const stream = this.shellStream;
+    if (!stream) return;
+    this.shellStream = null;
+    try {
+      stream.destroy();
+    } catch {
+    }
+    if (!silent) this.events.shellClosed({ reason });
   }
   // ----------------------------------------------------------------- filesystem
   requireSftp() {

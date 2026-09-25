@@ -497,6 +497,75 @@ code {
   color: #fca5a5;
 }
 
+/* ------------------------------------------------------ terminal drawer */
+
+.terminal-drawer {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: #0b0e13;
+  border-top: 1px solid #262d38;
+}
+
+.terminal-hidden {
+  display: none;
+}
+
+.terminal-resize-handle {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 7px;
+  cursor: row-resize;
+  z-index: 5;
+}
+
+.terminal-resize-handle:hover {
+  background: #3b82f640;
+}
+
+.terminal-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  background: #171b22;
+  border-bottom: 1px solid #20262f;
+  color: #8b96a5;
+  font-size: 12px;
+}
+
+.terminal-heading {
+  font-weight: 600;
+  color: #86efac;
+}
+
+.terminal-host {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-hint {
+  color: #5f6b7a;
+  font-size: 11px;
+}
+
+/* FitAddon measures this element: keep it padding-free so the terminal
+   fills the drawer edge to edge and rows/cols compute exactly */
+.terminal-body {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: #0e1116;
+}
+
+.terminal-body .xterm {
+  padding: 4px 6px;
+}
+
 /* ---------------------------------------------------------------- dialogs */
 
 .dialog-overlay {

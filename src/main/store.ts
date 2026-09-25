@@ -52,8 +52,10 @@ export const Store = {
       id: existing?.id ?? randomUUID(),
       passphraseEnc: undefined
     }
-    // Preserve any previously stored passphrase unless we get a new one
-    if (existing?.passphraseEnc) stored.passphraseEnc = existing.passphraseEnc
+    // Keep a remembered passphrase only while the profile still opts in.
+    if (profile.rememberPassphrase && existing?.passphraseEnc) {
+      stored.passphraseEnc = existing.passphraseEnc
+    }
 
     if (profile.rememberPassphrase && passphrase) {
       if (safeStorage.isEncryptionAvailable()) {
@@ -89,7 +91,7 @@ export const Store = {
 
   getPassphrase(profileId: string): string | undefined {
     const profile = Store.getProfile(profileId)
-    if (!profile?.passphraseEnc) return undefined
+    if (!profile?.rememberPassphrase || !profile.passphraseEnc) return undefined
     try {
       return safeStorage.decryptString(Buffer.from(profile.passphraseEnc, 'base64'))
     } catch {

@@ -68,6 +68,18 @@ export interface TransferUpdate {
   error?: string
 }
 
+export interface ShellOpenOptions {
+  /** Terminal width in columns */
+  cols: number
+  /** Terminal height in rows */
+  rows: number
+}
+
+export interface ShellClosedEvent {
+  /** Human-readable reason; undefined for a clean close */
+  reason?: string
+}
+
 export interface ElectronApi {
   // Connection
   connect(input: ConnectInput): Promise<void>
@@ -91,6 +103,14 @@ export interface ElectronApi {
   upload(localPaths: string[], remoteDir: string): Promise<void>
   download(remotePaths: string[], localDir: string): Promise<void>
   onTransfer(cb: (update: TransferUpdate) => void): () => void
+
+  // Shell (droplet command line)
+  shellOpen(options: ShellOpenOptions): Promise<void>
+  shellWrite(data: string): Promise<void>
+  shellResize(cols: number, rows: number): Promise<void>
+  shellClose(): Promise<void>
+  onShellData(cb: (data: string) => void): () => void
+  onShellClosed(cb: (event: ShellClosedEvent) => void): () => void
 
   // Profiles
   listProfiles(): Promise<Profile[]>

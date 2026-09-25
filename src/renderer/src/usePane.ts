@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { DirListing, Side } from '@shared/types'
 import { errorMessage } from './format'
 
@@ -24,22 +24,33 @@ export function usePane(side: Side): PaneApi {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const cwdRef = useRef('')
+  const requestSeq = useRef(0)
+
+  useEffect(
+    () => () => {
+      requestSeq.current++
+    },
+    []
+  )
 
   const load = useCallback(
     async (path?: string): Promise<void> => {
+      const requestId = ++requestSeq.current
       const target = path ?? cwdRef.current
       setBusy(true)
       try {
         const result =
           side === 'local' ? await window.api.listLocal(target) : await window.api.listRemote(target)
+        if (requestId !== requestSeq.current) return
         cwdRef.current = result.path
         setCwd(result.path)
         setListing(result)
         setError(null)
       } catch (err) {
+        if (requestId !== requestSeq.current) return
         setError(errorMessage(err))
       } finally {
-        setBusy(false)
+        if (requestId === requestSeq.current) setBusy(false)
       }
     },
     [side]
@@ -55,6 +66,7 @@ export function usePane(side: Side): PaneApi {
   }, [load])
 
   const reset = useCallback((): void => {
+    requestSeq.current++
     cwdRef.current = ''
     setCwd('')
     setListing(null)

@@ -2,7 +2,7 @@ import { dialog, ipcMain, type BrowserWindow, type OpenDialogOptions } from 'ele
 import { SshManager } from './ssh'
 import { Store } from './store'
 import { CH } from '../shared/channels'
-import type { ConnectInput, Profile, Side } from '../shared/types'
+import type { ConnectInput, Profile, ShellOpenOptions, Side } from '../shared/types'
 
 let win: BrowserWindow | null = null
 
@@ -18,7 +18,9 @@ export function registerIpc(): void {
   const manager = new SshManager({
     status: (status) => send(CH.status, status),
     hostKey: (request) => send(CH.hostKeyRequest, request),
-    transfer: (update) => send(CH.transferUpdate, update)
+    transfer: (update) => send(CH.transferUpdate, update),
+    shellData: (chunk) => send(CH.shellData, chunk),
+    shellClosed: (event) => send(CH.shellClosed, event)
   })
 
   // Connection
@@ -50,6 +52,14 @@ export function registerIpc(): void {
   ipcMain.handle(CH.download, (_e, remotePaths: string[], localDir: string) =>
     manager.download(remotePaths, localDir)
   )
+
+  // Shell
+  ipcMain.handle(CH.shellOpen, (_e, options: ShellOpenOptions) => manager.openShell(options))
+  ipcMain.handle(CH.shellWrite, (_e, data: string) => manager.writeShell(data))
+  ipcMain.handle(CH.shellResize, (_e, cols: number, rows: number) =>
+    manager.resizeShell(cols, rows)
+  )
+  ipcMain.handle(CH.shellClose, () => manager.closeShell())
 
   // Profiles
   ipcMain.handle(CH.profilesList, (): Profile[] =>

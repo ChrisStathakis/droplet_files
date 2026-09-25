@@ -1,10 +1,7 @@
 // Minimal 'electron' stub so src/main modules can run under plain Node in tests.
 const fs = require('fs')
-const os = require('os')
-const path = require('path')
-
-// Fixed user-data dir (the test wipes it before each run for fresh trust state)
-const userData = path.join(os.tmpdir(), 'droplet-files-e2e-userdata')
+const userData = process.env.DROPLET_FILES_TEST_USER_DATA
+if (!userData) throw new Error('DROPLET_FILES_TEST_USER_DATA must point to an isolated test directory')
 fs.mkdirSync(userData, { recursive: true })
 
 module.exports = {
@@ -12,8 +9,8 @@ module.exports = {
     getPath: () => userData
   },
   safeStorage: {
-    isEncryptionAvailable: () => false,
-    encryptString: (s) => Buffer.from(String(s), 'utf8'),
-    decryptString: (b) => Buffer.from(b).toString('utf8')
+    isEncryptionAvailable: () => true,
+    encryptString: (s) => Buffer.from(`test-only:${String(s)}`, 'utf8'),
+    decryptString: (b) => Buffer.from(b).toString('utf8').replace(/^test-only:/, '')
   }
 }

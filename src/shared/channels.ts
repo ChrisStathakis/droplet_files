@@ -19,8 +19,14 @@ export const CH = {
   profilesSave: 'profiles:save',
   profilesDelete: 'profiles:delete',
   pickKeyFile: 'dialog:keyfile',
+  shellOpen: 'shell:open',
+  shellWrite: 'shell:write',
+  shellResize: 'shell:resize',
+  shellClose: 'shell:close',
   // events (main -> renderer)
   status: 'conn:status',
   hostKeyRequest: 'hostkey:request',
-  transferUpdate: 'transfer:update'
+  transferUpdate: 'transfer:update',
+  shellData: 'shell:data',
+  shellClosed: 'shell:closed'
 } as const

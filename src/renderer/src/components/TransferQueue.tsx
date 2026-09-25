@@ -47,7 +47,8 @@ export function TransferQueue({ transfers, onClear }: Props): React.ReactElement
             <span className="transfer-bytes">
               {t.state === 'error' ? (
                 <span className="transfer-error-text" title={t.error}>
-                  ✗ {t.error ?? 'failed'}
+                  ✗ {formatSize(t.transferred, false)} / {formatSize(t.total, false)} —{' '}
+                  {t.error ?? 'failed'}
                 </span>
               ) : t.state === 'done' ? (
                 <>✓ {formatSize(t.total, false)}</>

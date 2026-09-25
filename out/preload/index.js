@@ -20,10 +20,16 @@ const CH = {
   profilesSave: "profiles:save",
   profilesDelete: "profiles:delete",
   pickKeyFile: "dialog:keyfile",
+  shellOpen: "shell:open",
+  shellWrite: "shell:write",
+  shellResize: "shell:resize",
+  shellClose: "shell:close",
   // events (main -> renderer)
   status: "conn:status",
   hostKeyRequest: "hostkey:request",
-  transferUpdate: "transfer:update"
+  transferUpdate: "transfer:update",
+  shellData: "shell:data",
+  shellClosed: "shell:closed"
 };
 function onEvent(channel) {
   return (cb) => {
@@ -50,6 +56,12 @@ const api = {
   upload: (localPaths, remoteDir) => electron.ipcRenderer.invoke(CH.upload, localPaths, remoteDir),
   download: (remotePaths, localDir) => electron.ipcRenderer.invoke(CH.download, remotePaths, localDir),
   onTransfer: onEvent(CH.transferUpdate),
+  shellOpen: (options) => electron.ipcRenderer.invoke(CH.shellOpen, options),
+  shellWrite: (data) => electron.ipcRenderer.invoke(CH.shellWrite, data),
+  shellResize: (cols, rows) => electron.ipcRenderer.invoke(CH.shellResize, cols, rows),
+  shellClose: () => electron.ipcRenderer.invoke(CH.shellClose),
+  onShellData: onEvent(CH.shellData),
+  onShellClosed: onEvent(CH.shellClosed),
   listProfiles: () => electron.ipcRenderer.invoke(CH.profilesList),
   saveProfile: (profile, passphrase) => electron.ipcRenderer.invoke(CH.profilesSave, profile, passphrase),
   deleteProfile: (id) => electron.ipcRenderer.invoke(CH.profilesDelete, id),

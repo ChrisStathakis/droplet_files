@@ -58,7 +58,9 @@ const Store = {
       id: existing?.id ?? crypto.randomUUID(),
       passphraseEnc: void 0
     };
-    if (existing?.passphraseEnc) stored.passphraseEnc = existing.passphraseEnc;
+    if (profile.rememberPassphrase && existing?.passphraseEnc) {
+      stored.passphraseEnc = existing.passphraseEnc;
+    }
     if (profile.rememberPassphrase && passphrase) {
       if (electron.safeStorage.isEncryptionAvailable()) {
         stored.passphraseEnc = electron.safeStorage.encryptString(passphrase).toString("base64");
@@ -88,7 +90,7 @@ const Store = {
   },
   getPassphrase(profileId) {
     const profile = Store.getProfile(profileId);
-    if (!profile?.passphraseEnc) return void 0;
+    if (!profile?.rememberPassphrase || !profile.passphraseEnc) return void 0;
     try {
       return electron.safeStorage.decryptString(Buffer.from(profile.passphraseEnc, "base64"));
     } catch {
@@ -145,6 +147,9 @@ class SshManager {
   events;
   client = null;
   sftp = null;
+  connectionGeneration = 0;
+  connectAbort = null;
+  shellStream = null;
   pendingHostKeys = /* @__PURE__ */ new Map();
   lock = Promise.resolve();
   transferSeq = 0;
@@ -159,36 +164,42 @@ class SshManager {
   // ---------------------------------------------------------------- connection
   async connect(input) {
     if (this.status.state === "connecting") throw new Error("Connection already in progress");
-    await this.disconnect();
     const label = `${input.username}@${input.host}:${input.port}`;
+    this.closeCurrentConnection();
+    const generation = ++this.connectionGeneration;
+    const abort = new AbortController();
+    this.connectAbort = abort;
     this.setStatus("connecting", label);
-    let privateKey;
     try {
-      privateKey = await fs.promises.readFile(input.keyPath);
-    } catch (err) {
-      this.setStatus("disconnected");
-      throw new Error(`Cannot read private key file "${input.keyPath}": ${errmsg(err)}`);
-    }
-    const passphrase = input.passphrase || (input.profileId ? Store.getPassphrase(input.profileId) : void 0) || void 0;
-    if (input.profileId && input.rememberPassphrase && input.passphrase) {
-      Store.rememberPassphrase(input.profileId, input.passphrase);
-    }
-    const hostVerifier = (key, verify) => {
-      void this.verifyHostKey(input, key, verify);
-    };
-    const config = {
-      host: input.host,
-      port: input.port,
-      username: input.username,
-      privateKey,
-      passphrase,
-      readyTimeout: 15e3,
-      keepaliveInterval: 1e4,
-      hostVerifier
-    };
-    const client = new ssh2.Client();
-    let settled = false;
-    try {
+      let privateKey;
+      try {
+        privateKey = await fs.promises.readFile(input.keyPath, { signal: abort.signal });
+      } catch (err) {
+        if (generation === this.connectionGeneration) {
+          throw new Error(`Cannot read private key file "${input.keyPath}": ${errmsg(err)}`);
+        }
+        throw err;
+      }
+      this.assertConnectionAttempt(generation);
+      const passphrase = input.passphrase || (input.rememberPassphrase && input.profileId ? Store.getPassphrase(input.profileId) : void 0) || void 0;
+      if (input.profileId && input.rememberPassphrase && input.passphrase) {
+        Store.rememberPassphrase(input.profileId, input.passphrase);
+      }
+      const hostVerifier = (key, verify) => {
+        void this.verifyHostKey(input, key, verify);
+      };
+      const config = {
+        host: input.host,
+        port: input.port,
+        username: input.username,
+        privateKey,
+        passphrase,
+        readyTimeout: 15e3,
+        keepaliveInterval: 1e4,
+        hostVerifier
+      };
+      const client = new ssh2.Client();
+      let settled = false;
       await new Promise((resolve, reject) => {
         const fail = (err) => {
           if (settled) return;
@@ -197,6 +208,10 @@ class SshManager {
         };
         client.on("ready", () => {
           if (settled) return;
+          if (generation !== this.connectionGeneration || this.client !== client) {
+            fail(new Error("Connection cancelled"));
+            return;
+          }
           settled = true;
           resolve();
         });
@@ -205,36 +220,45 @@ class SshManager {
           else if (this.client === client) this.handleUnexpectedClose(errmsg(err));
         });
         const onClosed = () => {
-          if (this.client !== client) return;
-          if (!settled) fail(new Error("Connection closed before reaching the server"));
-          else this.handleUnexpectedClose();
+          if (!settled) {
+            fail(new Error("Connection closed before reaching the server"));
+          } else if (generation === this.connectionGeneration && this.client === client) {
+            this.handleUnexpectedClose();
+          }
         };
         client.on("close", onClosed);
         client.on("end", onClosed);
         this.client = client;
         client.connect(config);
       });
-      this.sftp = await promisify((cb) => client.sftp(cb));
+      const sftp = await promisify((cb) => client.sftp(cb));
+      this.assertConnectionAttempt(generation);
+      this.sftp = sftp;
+      this.connectAbort = null;
       this.setStatus("connected", label);
     } catch (err) {
-      if (this.client === client) {
-        this.client = null;
-        this.sftp = null;
+      if (generation === this.connectionGeneration) {
+        this.connectAbort = null;
+        this.closeCurrentConnection();
+        this.setStatus("disconnected");
+        this.rejectPendingHostKeys();
       }
-      try {
-        client.end();
-      } catch {
-      }
-      this.rejectPendingHostKeys();
       const message = errmsg(err);
-      this.setStatus("disconnected");
       throw new Error(
         /host.*verif|host.*key/i.test(message) ? "Host key verification failed — the server identity could not be confirmed" : message
       );
     }
   }
   async disconnect() {
+    this.connectionGeneration++;
+    this.connectAbort?.abort();
+    this.connectAbort = null;
+    this.closeCurrentConnection();
+    if (this.status.state !== "disconnected") this.setStatus("disconnected");
+  }
+  closeCurrentConnection() {
     this.rejectPendingHostKeys();
+    this.endShell();
     const client = this.client;
     this.client = null;
     this.sftp = null;
@@ -244,11 +268,14 @@ class SshManager {
       } catch {
       }
     }
-    if (this.status.state !== "disconnected") this.setStatus("disconnected");
+  }
+  assertConnectionAttempt(generation) {
+    if (generation !== this.connectionGeneration) throw new Error("Connection cancelled");
   }
   handleUnexpectedClose(message) {
     this.client = null;
     this.sftp = null;
+    this.endShell(message);
     this.rejectPendingHostKeys();
     this.setStatus("disconnected", message || void 0);
   }
@@ -290,10 +317,90 @@ class SshManager {
     if (answer) Store.setTrustedFingerprint(hostPort, fingerprint);
     finish(answer);
   }
+  // ---------------------------------------------------------------------- shell
+  /**
+   * Opens an interactive shell (PTY) on the existing connection.
+   * Any previous session is replaced silently — only the new stream emits events.
+   */
+  async openShell(options) {
+    const client = this.client;
+    const generation = this.connectionGeneration;
+    if (!client || this.status.state !== "connected") {
+      throw new Error("Not connected to a server");
+    }
+    this.endShell(void 0, true);
+    const stream2 = await promisify(
+      (cb) => client.shell(
+        {
+          term: "xterm-256color",
+          cols: Math.max(2, Math.floor(options.cols)),
+          rows: Math.max(1, Math.floor(options.rows))
+        },
+        cb
+      )
+    );
+    if (generation !== this.connectionGeneration || this.client !== client) {
+      stream2.destroy();
+      throw new Error("Connection changed while opening the shell");
+    }
+    this.shellStream = stream2;
+    stream2.setEncoding("utf8");
+    stream2.stderr.setEncoding("utf8");
+    stream2.on("data", (chunk) => {
+      if (this.shellStream === stream2) this.events.shellData(chunk);
+    });
+    stream2.stderr.on("data", (chunk) => {
+      if (this.shellStream === stream2) this.events.shellData(chunk);
+    });
+    const finish = (reason) => {
+      if (this.shellStream !== stream2) return;
+      this.shellStream = null;
+      this.events.shellClosed({ reason });
+    };
+    stream2.on("error", (err) => finish(err.message));
+    stream2.on("close", () => finish());
+  }
+  /** Sends keystrokes to the shell; ignored when no session is open */
+  writeShell(data) {
+    const stream2 = this.shellStream;
+    if (!stream2) return;
+    stream2.write(data);
+  }
+  /** Tells the remote PTY about a terminal resize; ignored when no session is open */
+  resizeShell(cols, rows) {
+    const stream2 = this.shellStream;
+    if (!stream2) return;
+    stream2.setWindow(Math.max(1, Math.floor(rows)), Math.max(2, Math.floor(cols)), 0, 0);
+  }
+  closeShell() {
+    this.endShell();
+  }
+  /** Ends the shell channel; `silent` skips the shellClosed event (session swap) */
+  endShell(reason, silent = false) {
+    const stream2 = this.shellStream;
+    if (!stream2) return;
+    this.shellStream = null;
+    try {
+      stream2.destroy();
+    } catch {
+    }
+    if (!silent) this.events.shellClosed({ reason });
+  }
   // ----------------------------------------------------------------- filesystem
   requireSftp() {
     if (!this.isConnected() || !this.sftp) throw new Error("Not connected to a server");
     return this.sftp;
+  }
+  captureTransferSession() {
+    return { sftp: this.requireSftp(), generation: this.connectionGeneration };
+  }
+  assertTransferSession(session) {
+    if (session.generation !== this.connectionGeneration || this.sftp !== session.sftp || !this.isConnected()) {
+      throw new Error("Connection changed during transfer; the transfer was stopped");
+    }
+  }
+  isCurrentTransferSession(session) {
+    return session.generation === this.connectionGeneration && this.sftp === session.sftp && this.isConnected();
   }
   async listRemote(dir) {
     const sftp = this.requireSftp();
@@ -411,8 +518,34 @@ class SshManager {
   }
   async copyLocal(sources, destDir) {
     for (const src of sources) {
-      const dest = path__namespace.join(destDir, path__namespace.basename(src));
-      await fs.promises.cp(src, dest, { recursive: true, force: true, errorOnExist: false });
+      const base = path__namespace.basename(src);
+      for (; ; ) {
+        const name = await uniqueName(
+          destDir,
+          base,
+          (dir, entry) => path__namespace.join(dir, entry),
+          async (candidate) => {
+            try {
+              await fs.promises.lstat(candidate);
+              return true;
+            } catch (err) {
+              if (err.code === "ENOENT") return false;
+              throw err;
+            }
+          }
+        );
+        try {
+          await fs.promises.cp(src, path__namespace.join(destDir, name), {
+            recursive: true,
+            force: false,
+            errorOnExist: true
+          });
+          break;
+        } catch (err) {
+          const code = err.code;
+          if (code !== "EEXIST" && code !== "ERR_FS_CP_EEXIST") throw err;
+        }
+      }
     }
   }
   // ----------------------------------------------------------------- transfers
@@ -426,68 +559,92 @@ class SshManager {
     return result;
   }
   async upload(localPaths, remoteDir) {
-    const sftp = this.requireSftp();
+    const session = this.captureTransferSession();
     return this.withLock(async () => {
+      this.assertTransferSession(session);
       for (const src of localPaths) {
+        this.assertTransferSession(session);
         const st = await fs.promises.lstat(src);
         const base = path__namespace.basename(src);
         const destName = await uniqueName(
           remoteDir,
           base,
           (d, n) => path__namespace.posix.join(d, n),
-          (p) => sftpExists(sftp, p)
+          (p) => sftpExists(session.sftp, p)
         );
         const dest = path__namespace.posix.join(remoteDir, destName);
-        if (st.isDirectory()) await this.uploadDir(src, dest);
-        else await this.uploadFile(src, dest, destName);
+        if (st.isDirectory()) await this.uploadDir(session, src, dest);
+        else await this.uploadFile(session, src, dest, destName);
       }
     });
   }
-  async uploadDir(localDir, remoteDir) {
-    const sftp = this.requireSftp();
-    try {
-      await sftpCall((done) => sftp.mkdir(remoteDir, done));
-    } catch (err) {
-      if (!await sftpExists(sftp, remoteDir)) throw err;
-    }
+  async uploadDir(session, localDir, remoteDir) {
+    this.assertTransferSession(session);
+    await sftpCall((done) => session.sftp.mkdir(remoteDir, done));
     const dirents = await fs.promises.readdir(localDir, { withFileTypes: true });
     for (const d of dirents) {
+      this.assertTransferSession(session);
       const full = path__namespace.join(localDir, d.name);
       const dest = path__namespace.posix.join(remoteDir, d.name);
-      if (d.isDirectory()) await this.uploadDir(full, dest);
-      else if (d.isFile()) await this.uploadFile(full, dest, d.name);
+      if (d.isDirectory()) await this.uploadDir(session, full, dest);
+      else if (d.isFile()) await this.uploadFile(session, full, dest, d.name);
     }
   }
-  async uploadFile(localPath, remotePath, name) {
-    const sftp = this.requireSftp();
+  async uploadFile(session, localPath, remotePath, name) {
     const id = String(++this.transferSeq);
     let total = 0;
+    let transferred = 0;
+    let tempPath = null;
     try {
+      this.assertTransferSession(session);
       const st = await fs.promises.stat(localPath);
       total = st.size;
       this.emitTransfer({ id, name, direction: "up", state: "queued", transferred: 0, total });
       this.emitTransfer({ id, name, direction: "up", state: "active", transferred: 0, total });
+      tempPath = path__namespace.posix.join(
+        path__namespace.posix.dirname(remotePath),
+        `.droplet-${crypto.randomUUID()}.part`
+      );
       const source = fs.createReadStream(localPath);
-      const counter = this.counter(id, name, "up", total);
-      const dest = sftp.createWriteStream(remotePath);
+      const counter = this.counter(id, name, "up", total, (count) => transferred = count);
+      const dest = session.sftp.createWriteStream(tempPath, { flags: "wx" });
       await promises.pipeline(source, counter, dest);
+      this.assertTransferSession(session);
+      if (await sftpExists(session.sftp, remotePath)) {
+        throw new Error(`Destination already exists: ${remotePath}`);
+      }
+      await sftpCall((done) => session.sftp.rename(tempPath, remotePath, done));
+      tempPath = null;
       this.emitTransfer({ id, name, direction: "up", state: "done", transferred: total, total });
     } catch (err) {
+      let message = errmsg(err);
+      if (tempPath && this.isCurrentTransferSession(session)) {
+        try {
+          await sftpCall((done) => session.sftp.unlink(tempPath, done));
+          tempPath = null;
+        } catch {
+          message += ` (partial remote file may remain at ${tempPath})`;
+        }
+      } else if (tempPath) {
+        message += ` (partial remote file may remain at ${tempPath})`;
+      }
       this.emitTransfer({
         id,
         name,
         direction: "up",
         state: "error",
-        transferred: 0,
+        transferred,
         total,
-        error: errmsg(err)
+        error: message
       });
     }
   }
   async download(remotePaths, localDir) {
-    const sftp = this.requireSftp();
+    const session = this.captureTransferSession();
     return this.withLock(async () => {
+      this.assertTransferSession(session);
       for (const src of remotePaths) {
+        this.assertTransferSession(session);
         const base = path__namespace.posix.basename(src);
         const destName = await uniqueName(
           localDir,
@@ -496,58 +653,71 @@ class SshManager {
           (p) => fs.promises.access(p).then(() => true).catch(() => false)
         );
         const dest = path__namespace.join(localDir, destName);
-        const st = await promisify((cb) => sftp.lstat(src, cb));
-        if (st.isDirectory() && !st.isSymbolicLink()) await this.downloadDir(src, dest);
-        else await this.downloadFile(src, dest, destName);
+        const st = await promisify((cb) => session.sftp.lstat(src, cb));
+        if (st.isDirectory() && !st.isSymbolicLink()) await this.downloadDir(session, src, dest);
+        else await this.downloadFile(session, src, dest, destName);
       }
     });
   }
-  async downloadDir(remoteDir, localDir) {
-    const sftp = this.requireSftp();
+  async downloadDir(session, remoteDir, localDir) {
+    this.assertTransferSession(session);
     await fs.promises.mkdir(localDir, { recursive: true });
-    const list = await promisify((cb) => sftp.readdir(remoteDir, cb));
+    const list = await promisify(
+      (cb) => session.sftp.readdir(remoteDir, cb)
+    );
     for (const entry of list) {
+      this.assertTransferSession(session);
       const src = path__namespace.posix.join(remoteDir, entry.filename);
       const dest = path__namespace.join(localDir, entry.filename);
       if (entry.attrs.isDirectory() && !entry.attrs.isSymbolicLink()) {
-        await this.downloadDir(src, dest);
+        await this.downloadDir(session, src, dest);
       } else if (!entry.attrs.isSymbolicLink()) {
-        await this.downloadFile(src, dest, entry.filename);
+        await this.downloadFile(session, src, dest, entry.filename);
       }
     }
   }
-  async downloadFile(remotePath, localPath, name) {
-    const sftp = this.requireSftp();
+  async downloadFile(session, remotePath, localPath, name) {
     const id = String(++this.transferSeq);
     let total = 0;
+    let transferred = 0;
+    const tempPath = path__namespace.join(path__namespace.dirname(localPath), `.droplet-${crypto.randomUUID()}.part`);
+    let tempExists = false;
     try {
-      const st = await promisify((cb) => sftp.stat(remotePath, cb));
+      this.assertTransferSession(session);
+      const st = await promisify((cb) => session.sftp.stat(remotePath, cb));
       total = st.size;
       this.emitTransfer({ id, name, direction: "down", state: "queued", transferred: 0, total });
       this.emitTransfer({ id, name, direction: "down", state: "active", transferred: 0, total });
-      const source = sftp.createReadStream(remotePath);
-      const counter = this.counter(id, name, "down", total);
-      const dest = fs.createWriteStream(localPath);
+      const source = session.sftp.createReadStream(remotePath);
+      const counter = this.counter(id, name, "down", total, (count) => transferred = count);
+      const dest = fs.createWriteStream(tempPath, { flags: "wx" });
+      tempExists = true;
       await promises.pipeline(source, counter, dest);
+      this.assertTransferSession(session);
+      await fs.promises.copyFile(tempPath, localPath, fs.constants.COPYFILE_EXCL);
+      await fs.promises.rm(tempPath, { force: true });
+      tempExists = false;
       this.emitTransfer({ id, name, direction: "down", state: "done", transferred: total, total });
     } catch (err) {
+      if (tempExists) await fs.promises.rm(tempPath, { force: true }).catch(() => void 0);
       this.emitTransfer({
         id,
         name,
         direction: "down",
         state: "error",
-        transferred: 0,
+        transferred,
         total,
         error: errmsg(err)
       });
     }
   }
-  counter(id, name, direction, total) {
+  counter(id, name, direction, total, onProgress) {
     let transferred = 0;
     let lastEmit = 0;
     return new stream.Transform({
       transform: (chunk, _enc, cb) => {
         transferred += chunk.length;
+        onProgress(transferred);
         const now = Date.now();
         if (now - lastEmit >= PROGRESS_INTERVAL_MS || transferred >= total) {
           lastEmit = now;
@@ -581,10 +751,16 @@ const CH = {
   profilesSave: "profiles:save",
   profilesDelete: "profiles:delete",
   pickKeyFile: "dialog:keyfile",
+  shellOpen: "shell:open",
+  shellWrite: "shell:write",
+  shellResize: "shell:resize",
+  shellClose: "shell:close",
   // events (main -> renderer)
   status: "conn:status",
   hostKeyRequest: "hostkey:request",
-  transferUpdate: "transfer:update"
+  transferUpdate: "transfer:update",
+  shellData: "shell:data",
+  shellClosed: "shell:closed"
 };
 let win = null;
 function setMainWindow(window) {
@@ -597,7 +773,9 @@ function registerIpc() {
   const manager = new SshManager({
     status: (status) => send(CH.status, status),
     hostKey: (request) => send(CH.hostKeyRequest, request),
-    transfer: (update) => send(CH.transferUpdate, update)
+    transfer: (update) => send(CH.transferUpdate, update),
+    shellData: (chunk) => send(CH.shellData, chunk),
+    shellClosed: (event) => send(CH.shellClosed, event)
   });
   electron.ipcMain.handle(CH.connect, (_e, input) => manager.connect(input));
   electron.ipcMain.handle(CH.disconnect, () => manager.disconnect());
@@ -628,6 +806,13 @@ function registerIpc() {
     CH.download,
     (_e, remotePaths, localDir) => manager.download(remotePaths, localDir)
   );
+  electron.ipcMain.handle(CH.shellOpen, (_e, options) => manager.openShell(options));
+  electron.ipcMain.handle(CH.shellWrite, (_e, data) => manager.writeShell(data));
+  electron.ipcMain.handle(
+    CH.shellResize,
+    (_e, cols, rows) => manager.resizeShell(cols, rows)
+  );
+  electron.ipcMain.handle(CH.shellClose, () => manager.closeShell());
   electron.ipcMain.handle(
     CH.profilesList,
     () => Store.listProfiles().map(({ passphraseEnc: _ignored, ...profile }) => profile)

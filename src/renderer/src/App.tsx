@@ -9,6 +9,7 @@ import type {
 import { ConnectionBar, emptyForm, type ConnectionForm } from './components/ConnectionBar'
 import { FilePane } from './components/FilePane'
 import { HostKeyDialog } from './components/HostKeyDialog'
+import { TerminalDrawer } from './components/TerminalDrawer'
 import { TransferQueue } from './components/TransferQueue'
 import { useDialogs } from './dialogs'
 import { errorMessage } from './format'
@@ -23,6 +24,7 @@ export default function App(): React.ReactElement {
   const [transfers, setTransfers] = useState<TransferUpdate[]>([])
   const [connectError, setConnectError] = useState<string | null>(null)
   const [roots, setRoots] = useState<string[]>([])
+  const [terminalOpen, setTerminalOpen] = useState(false)
 
   const localPane = usePane('local')
   const remotePane = usePane('remote')
@@ -52,6 +54,23 @@ export default function App(): React.ReactElement {
   useEffect(() => {
     if (status.state === 'disconnected') remotePane.reset()
   }, [status.state, remotePane.reset])
+
+  // Hide the terminal drawer when the connection goes away
+  useEffect(() => {
+    if (status.state === 'disconnected') setTerminalOpen(false)
+  }, [status.state])
+
+  // Ctrl+` toggles the terminal drawer
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.code === 'Backquote' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault()
+        setTerminalOpen((open) => !open)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   // Initial load: local home + drive roots + saved profiles
   useEffect(() => {
@@ -243,6 +262,8 @@ export default function App(): React.ReactElement {
         onSaveProfile={() => void handleSaveProfile()}
         onDeleteProfile={() => void handleDeleteProfile()}
         onPickKey={() => void handlePickKey()}
+        terminalOpen={terminalOpen}
+        onToggleTerminal={() => setTerminalOpen((open) => !open)}
       />
 
       <main className="panes">
@@ -265,6 +286,14 @@ export default function App(): React.ReactElement {
           onDropFiles={uploadInto}
         />
       </main>
+
+      {connected && (
+        <TerminalDrawer
+          visible={terminalOpen}
+          title={status.message ?? 'Shell'}
+          onClose={() => setTerminalOpen(false)}
+        />
+      )}
 
       <TransferQueue
         transfers={transfers}

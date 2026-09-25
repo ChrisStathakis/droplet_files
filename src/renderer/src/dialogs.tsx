@@ -15,10 +15,12 @@ interface DialogProps {
 
 function Dialog({ state, close }: DialogProps): ReactNode {
   const inputRef = useRef<HTMLInputElement>(null)
+  const cancelRef = useRef<HTMLButtonElement>(null)
   const [value, setValue] = useState(state.initial ?? '')
 
   useEffect(() => {
     if (state.kind === 'input') inputRef.current?.select()
+    else cancelRef.current?.focus()
     const onKey = (e: KeyboardEvent): void => {
       if (e.key === 'Escape') close(null)
     }
@@ -45,9 +47,27 @@ function Dialog({ state, close }: DialogProps): ReactNode {
       <div
         className="dialog"
         role="dialog"
+        aria-modal="true"
         aria-label={state.title}
         onKeyDown={(e) => {
-          if (e.key === 'Enter') submit()
+          if (e.key !== 'Tab') return
+          const focusable = e.currentTarget.querySelectorAll<HTMLElement>(
+            'button:not(:disabled), input:not(:disabled), [href], [tabindex]:not([tabindex="-1"])'
+          )
+          if (focusable.length === 0) {
+            e.preventDefault()
+            e.currentTarget.focus()
+            return
+          }
+          const first = focusable[0]
+          const last = focusable[focusable.length - 1]
+          if (e.shiftKey && document.activeElement === first) {
+            e.preventDefault()
+            last.focus()
+          } else if (!e.shiftKey && document.activeElement === last) {
+            e.preventDefault()
+            first.focus()
+          }
         }}
       >
         <div className="dialog-title">{state.title}</div>
@@ -58,11 +78,17 @@ function Dialog({ state, close }: DialogProps): ReactNode {
             className="input dialog-input"
             value={value}
             onChange={(e) => setValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                submit()
+              }
+            }}
             spellCheck={false}
           />
         )}
         <div className="dialog-actions">
-          <button className="btn" onClick={() => close(null)}>
+          <button ref={cancelRef} className="btn" onClick={() => close(null)}>
             Cancel
           </button>
           <button className={`btn ${state.kind === 'confirm' ? 'btn-danger' : 'btn-primary'}`} onClick={submit}>

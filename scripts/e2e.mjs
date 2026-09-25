@@ -19,12 +19,17 @@ const {
     sftp: { STATUS_CODE, OPEN_MODE }
   }
 } = require('ssh2')
+const net = require('net')
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const abs = (p) => path.join(root, p)
 
-// Fresh user-data dir so host-key trust state starts empty every run
-const USERDATA = path.join(require('os').tmpdir(), 'droplet-files-e2e-userdata')
+// All generated files and Electron user data stay inside this disposable directory.
+const tmp = fs.mkdtempSync(path.join(require('os').tmpdir(), 'droplet-files-e2e-'))
+const USERDATA = path.join(tmp, 'user-data')
+process.env.DROPLET_FILES_TEST_USER_DATA = USERDATA
+fs.symlinkSync(path.join(root, 'node_modules'), path.join(tmp, 'node_modules'), 'junction')
+fs.mkdirSync(USERDATA, { recursive: true })
 fs.rmSync(USERDATA, { recursive: true, force: true })
 
 // ---------------------------------------------------------------- assertions
@@ -48,6 +53,15 @@ function section(name) {
   console.log(`\n${name}`)
 }
 
+/** Polls until cond() is true or the timeout elapses; returns the final value */
+async function until(cond, timeout = 3000) {
+  const start = Date.now()
+  while (!cond() && Date.now() - start < timeout) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  return cond()
+}
+
 // ------------------------------------------------------------------- MemFS
 
 function dirNode() {
@@ -63,6 +77,8 @@ function fileNode(content) {
 class MemFS {
   constructor() {
     this.nodes = new Map([['/', dirNode()]])
+    this.failNextWrite = false
+    this.failReadPath = null
   }
 
   normalize(p) {
@@ -229,11 +245,16 @@ function wireSftp(sftp, mem) {
       let node = mem.get(p)
       const wantsWrite = (pflags & OPEN_MODE.WRITE) === OPEN_MODE.WRITE
       if (wantsWrite) {
+        if (node && (pflags & OPEN_MODE.EXCL) === OPEN_MODE.EXCL) {
+          return sftp.status(reqid, STATUS_CODE.FAILURE)
+        }
         if (!node && (pflags & OPEN_MODE.CREAT)) node = mem.createFile(p)
         if (!node) return nofile(reqid)
         if (node.type !== 'file') return sftp.status(reqid, STATUS_CODE.FAILURE)
         if ((pflags & OPEN_MODE.TRUNC) === OPEN_MODE.TRUNC) node.content = Buffer.alloc(0)
-        return sftp.handle(reqid, handleFor({ type: 'file', path: p }))
+        const failWrite = mem.failNextWrite
+        mem.failNextWrite = false
+        return sftp.handle(reqid, handleFor({ type: 'file', path: p, failWrite }))
       }
       if (!node || node.type !== 'file') return nofile(reqid)
       sftp.handle(reqid, handleFor({ type: 'file', path: p }))
@@ -242,6 +263,9 @@ function wireSftp(sftp, mem) {
       const rec = open.get(idOf(handle))
       const node = rec && mem.get(rec.path)
       if (!node || node.type !== 'file') return nofile(reqid)
+      if (mem.failReadPath === rec.path && offset >= 256 * 1024) {
+        return sftp.status(reqid, STATUS_CODE.FAILURE)
+      }
       if (offset >= node.content.length) return sftp.status(reqid, STATUS_CODE.EOF)
       sftp.data(reqid, node.content.subarray(offset, offset + len))
     })
@@ -249,6 +273,7 @@ function wireSftp(sftp, mem) {
       const rec = open.get(idOf(handle))
       const node = rec && mem.get(rec.path)
       if (!node || node.type !== 'file') return nofile(reqid)
+      if (rec.failWrite && offset > 0) return sftp.status(reqid, STATUS_CODE.FAILURE)
       writeAt(node, offset, data)
       node.mtime = Date.now()
       sftp.status(reqid, STATUS_CODE.OK)
@@ -281,12 +306,7 @@ function wireSftp(sftp, mem) {
       const node = mem.get(src)
       if (!node) return nofile(reqid)
       const existing = mem.get(dst)
-      if (existing) {
-        if (existing.type === 'dir' && mem.hasChildren(dst)) {
-          return sftp.status(reqid, STATUS_CODE.FAILURE)
-        }
-        mem.nodes.delete(dst)
-      }
+      if (existing) return sftp.status(reqid, STATUS_CODE.FAILURE)
       if (!mem.nodes.has(mem.parent(dst))) return sftp.status(reqid, STATUS_CODE.FAILURE)
       mem.nodes.delete(src)
       mem.nodes.set(dst, node)
@@ -319,8 +339,6 @@ function generateKeyPem() {
 }
 
 // ---------------------------------------------------------------- helpers
-
-const tmp = fs.mkdtempSync(path.join(require('os').tmpdir(), 'droplet-files-e2e-'))
 
 function seedLocal(dir) {
   fs.mkdirSync(path.join(dir, 'assets'), { recursive: true })
@@ -355,7 +373,7 @@ function compareDirs(a, b) {
 async function main() {
   // 1. Bundle the real SshManager for plain Node
   section('bundle')
-  const outfile = abs('scripts/.ssh.bundle.cjs')
+  const outfile = path.join(tmp, 'ssh.bundle.cjs')
   await build({
     entryPoints: [abs('src/main/ssh.ts')],
     bundle: true,
@@ -369,6 +387,33 @@ async function main() {
   check('esbuild bundled src/main/ssh.ts', fs.existsSync(outfile))
   const { SshManager } = require(outfile)
   check('SshManager exported', typeof SshManager === 'function')
+  const storeBundle = path.join(tmp, 'store.bundle.cjs')
+  await build({
+    entryPoints: [abs('src/main/store.ts')],
+    bundle: true,
+    platform: 'node',
+    format: 'cjs',
+    alias: { electron: abs('scripts/electron-stub.cjs') },
+    outfile: storeBundle,
+    logLevel: 'warning'
+  })
+  const { Store } = require(storeBundle)
+
+  section('saved passphrase preference')
+  const savedProfile = Store.saveProfile(
+    {
+      label: 'test',
+      host: 'example.invalid',
+      port: 22,
+      username: 'tester',
+      keyPath: 'test-key',
+      rememberPassphrase: true
+    },
+    'test secret'
+  )
+  check('remembered passphrase is available while enabled', Store.getPassphrase(savedProfile.id) === 'test secret')
+  Store.saveProfile({ ...savedProfile, rememberPassphrase: false })
+  check('disabling remember removes the stored passphrase', Store.getPassphrase(savedProfile.id) === undefined)
 
   // 2. Start loopback SSH server with in-memory SFTP
   const mem = new MemFS()
@@ -378,6 +423,9 @@ async function main() {
 
   const hostKeyPem = generateKeyPem()
   check('server host key parses', !!parseKey(hostKeyPem))
+
+  // State of the most recent shell session, asserted on by the shell tests
+  const shellState = { opened: false, received: '', cols: 0, rows: 0 }
 
   const server = new Server({ hostKeys: [hostKeyPem] }, (client) => {
     // The client disconnects mid-handshake when it rejects our host key;
@@ -391,6 +439,35 @@ async function main() {
       client.on('session', (accept) => {
         const session = accept()
         session.on('sftp', (acceptSftp) => wireSftp(acceptSftp(), mem))
+        // Shell: echo every chunk back, close the channel on 'exit'
+        session.on('pty', (acceptPty, _reject, data) => {
+          shellState.cols = data.cols
+          shellState.rows = data.rows
+          if (acceptPty) acceptPty()
+        })
+        session.on('window-change', (accept, _reject, data) => {
+          shellState.cols = data.cols
+          shellState.rows = data.rows
+          if (accept) accept()
+        })
+        session.on('shell', (acceptShell) => {
+          const chan = acceptShell()
+          shellState.opened = true
+          shellState.received = ''
+          chan.on('data', (chunk) => {
+            const text = chunk.toString('utf8')
+            if (text === 'exit') {
+              shellState.opened = false
+              chan.close()
+              return
+            }
+            shellState.received += text
+            chan.write(`echo:${text}`)
+          })
+          chan.on('close', () => {
+            shellState.opened = false
+          })
+        })
       })
     })
   })
@@ -407,6 +484,8 @@ async function main() {
   const transfers = []
   const transferLog = []
   const hostKeyRequests = []
+  const shellData = []
+  const shellClosed = []
   // 'accept' | 'reject' | 'hold' — how the test answers host-key prompts
   let hostKeyMode = 'accept'
   const manager = new SshManager({
@@ -420,7 +499,9 @@ async function main() {
       const idx = transfers.findIndex((t) => t.id === u.id)
       if (idx === -1) transfers.push(u)
       else transfers[idx] = u
-    }
+    },
+    shellData: (chunk) => shellData.push(chunk),
+    shellClosed: (event) => shellClosed.push(event)
   })
 
   const connectInput = {
@@ -517,6 +598,28 @@ async function main() {
     transferLog.filter((t) => t.name === 'up.bin').map((t) => t.state).join(',')
   )
 
+  section('failed transfer cleanup and progress')
+  const failedUploadPath = path.join(tmp, 'failed-upload.bin')
+  fs.writeFileSync(failedUploadPath, Buffer.alloc(1024 * 1024, 7))
+  mem.failNextWrite = true
+  await manager.upload([failedUploadPath], '/')
+  const failedUpload = transfers.find((t) => t.name === 'failed-upload.bin')
+  check('failed upload reports transferred bytes', (failedUpload?.transferred ?? 0) > 0)
+  check('failed upload leaves no partial destination or temporary file',
+    !mem.get('/failed-upload.bin') && mem.children('/').every(([name]) => !name.startsWith('.droplet-')))
+
+  const failedDownloadPath = path.join(tmp, 'downloads')
+  fs.mkdirSync(failedDownloadPath, { recursive: true })
+  mem.createFile('/failed-download.bin', Buffer.alloc(1024 * 1024, 9))
+  mem.failReadPath = '/failed-download.bin'
+  await manager.download(['/failed-download.bin'], failedDownloadPath)
+  mem.failReadPath = null
+  const failedDownload = transfers.find((t) => t.name === 'failed-download.bin')
+  check('failed download reports transferred bytes', (failedDownload?.transferred ?? 0) > 0)
+  check('failed download leaves no partial destination or temporary file',
+    !fs.existsSync(path.join(failedDownloadPath, 'failed-download.bin')) &&
+      fs.readdirSync(failedDownloadPath).every((name) => !name.startsWith('.droplet-')))
+
   section('upload name collision gets suffixed')
   const readLocal = path.join(tmp, 'readme.txt')
   fs.writeFileSync(readLocal, Buffer.from('local copy\n'))
@@ -564,6 +667,11 @@ async function main() {
   fs.mkdirSync(copyDst, { recursive: true })
   await manager.copyLocal([readLocal], copyDst)
   check('copyLocal copied the file', fs.readFileSync(path.join(copyDst, 'readme.txt')).equals(Buffer.from('local copy\n')))
+  fs.writeFileSync(path.join(copyDst, 'readme.txt'), 'keep this original')
+  await manager.copyLocal([readLocal], copyDst)
+  check('copyLocal preserves collisions and creates a suffixed copy',
+    fs.readFileSync(path.join(copyDst, 'readme.txt'), 'utf8') === 'keep this original' &&
+      fs.readFileSync(path.join(copyDst, 'readme (1).txt'), 'utf8') === 'local copy\n')
   let mkdirFailed = false
   try {
     await manager.mkdir('remote', '/readme.txt/nested')
@@ -572,9 +680,76 @@ async function main() {
   }
   check('mkdir under a file fails with an error', mkdirFailed)
 
+  section('shell session (droplet command line)')
+  manager.writeShell('ignored') // no session open yet — must not throw
+  check('writeShell without a session is a safe no-op', shellData.length === 0)
+  let shellErr = ''
+  try {
+    await manager.openShell({ cols: 100, rows: 40 })
+  } catch (err) {
+    shellErr = err.message
+  }
+  check('shell opens on a connected session', shellErr === '', shellErr)
+  check('server accepted the shell channel', await until(() => shellState.opened))
+  check(
+    'PTY opened with the requested 100x40 size',
+    shellState.cols === 100 && shellState.rows === 40,
+    `${shellState.cols}x${shellState.rows}`
+  )
+  manager.writeShell('hello shell')
+  check(
+    'keystrokes reach the remote shell',
+    await until(() => shellState.received.includes('hello shell'))
+  )
+  check(
+    'shell output is forwarded to the renderer',
+    await until(() => shellData.join('').includes('echo:hello shell')),
+    JSON.stringify(shellData.join(''))
+  )
+  manager.resizeShell(120, 50)
+  check(
+    'window-change updates the remote PTY to 120x50',
+    await until(() => shellState.cols === 120 && shellState.rows === 50),
+    `${shellState.cols}x${shellState.rows}`
+  )
+  manager.writeShell('exit')
+  check(
+    'shellClosed fires when the remote ends the session',
+    await until(() => shellClosed.length === 1),
+    shellClosed.length
+  )
+  manager.writeShell('after-close') // stream is gone — must not throw
+  check('writeShell after close is a safe no-op', shellClosed.length === 1)
+  // Re-open so the disconnect section can verify teardown
+  await manager.openShell({ cols: 80, rows: 24 })
+  check('shell can be re-opened on the same connection', await until(() => shellState.opened))
+
+  section('queued transfer remains bound to its connection')
+  const queuedPath = path.join(tmp, 'queued-old-session.txt')
+  fs.writeFileSync(queuedPath, 'must not move to a later session')
+  const savedLock = manager.lock
+  let releaseQueuedWork
+  manager.lock = new Promise((resolve) => {
+    releaseQueuedWork = resolve
+  })
+  const staleUpload = manager.upload([queuedPath], '/')
+  await manager.disconnect()
+  await manager.connect(connectInput)
+  releaseQueuedWork()
+  const staleResult = await staleUpload.then(() => false, (err) => /Connection changed/.test(err.message))
+  check('queued upload is rejected after reconnect', staleResult)
+  check('queued upload wrote nothing to the reconnected server', !mem.get('/queued-old-session.txt'))
+  await manager.lock
+  manager.lock = savedLock
+
   section('disconnect')
   await manager.disconnect()
   check('status reports disconnected', statuses.at(-1).state === 'disconnected')
+  check(
+    'disconnect closes the open shell',
+    shellClosed.length === 2,
+    shellClosed.length
+  )
   let listFailed = false
   try {
     await manager.listRemote('/')
@@ -582,6 +757,37 @@ async function main() {
     listFailed = /Not connected/.test(err.message)
   }
   check('operations after disconnect throw', listFailed)
+  let shellFailed = false
+  try {
+    await manager.openShell({ cols: 80, rows: 24 })
+  } catch (err) {
+    shellFailed = /Not connected/.test(err.message)
+  }
+  check('openShell after disconnect throws', shellFailed)
+  manager.writeShell('ignored') // must not throw
+  check('writeShell after disconnect is a safe no-op', shellClosed.length === 2)
+
+  section('disconnect settles an in-flight SSH handshake')
+  const stalledServer = net.createServer(() => {})
+  const identificationReceived = new Promise((resolve) => {
+    stalledServer.once('connection', (socket) => {
+      socket.once('data', resolve)
+    })
+  })
+  await new Promise((resolve) => stalledServer.listen(0, '127.0.0.1', resolve))
+  const stalledPort = stalledServer.address().port
+  const cancelManager = new SshManager({
+    status: () => {}, hostKey: () => {}, transfer: () => {}, shellData: () => {}, shellClosed: () => {}
+  })
+  const cancelledConnect = cancelManager.connect({ ...connectInput, port: stalledPort })
+  await identificationReceived
+  await cancelManager.disconnect()
+  const cancellationSettled = await Promise.race([
+    cancelledConnect.then(() => false, () => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 1000))
+  ])
+  check('cancelled connection request settles promptly', cancellationSettled)
+  stalledServer.close()
 
   // ---------------------------------------------------------------- summary
   server.close()
@@ -596,5 +802,6 @@ async function main() {
 
 main().catch((err) => {
   console.error('\nE2E crashed:', err)
+  fs.rmSync(tmp, { recursive: true, force: true })
   process.exit(1)
 })

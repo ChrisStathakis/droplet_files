@@ -1,8 +1,60 @@
-import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow, Menu, Tray, nativeImage } from 'electron'
 import { join } from 'path'
 import { registerIpc, setMainWindow } from './ipc'
 
 let mainWindow: BrowserWindow | null = null
+let tray: Tray | null = null
+let quitting = false
+
+function trayIconPath(): string {
+  return app.isPackaged
+    ? join(process.resourcesPath, 'icon.ico')
+    : join(app.getAppPath(), 'build', 'icon.ico')
+}
+
+function showWindow(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow()
+    return
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+/**
+ * While scheduled actions are enabled the window can be closed to the tray,
+ * so backups keep running in the background. Without actions, closing quits.
+ */
+function setTrayRequired(required: boolean): void {
+  try {
+    if (required && !tray) {
+      const image = nativeImage.createFromPath(trayIconPath())
+      tray = new Tray(image)
+      tray.setToolTip('Droplet Files — scheduled backups are on')
+      tray.setContextMenu(
+        Menu.buildFromTemplate([
+          { label: 'Show Droplet Files', click: () => showWindow() },
+          { type: 'separator' },
+          {
+            label: 'Quit',
+            click: () => {
+              quitting = true
+              app.quit()
+            }
+          }
+        ])
+      )
+      tray.on('click', () => showWindow())
+    } else if (!required && tray) {
+      tray.destroy()
+      tray = null
+    }
+  } catch (err) {
+    console.error('[tray] could not create the tray icon:', err)
+    tray = null
+  }
+}
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -22,6 +74,13 @@ function createWindow(): void {
   })
   setMainWindow(mainWindow)
 
+  mainWindow.on('close', (event) => {
+    if (!quitting && tray) {
+      event.preventDefault()
+      mainWindow?.hide()
+    }
+  })
+
   mainWindow.on('closed', () => {
     mainWindow = null
     setMainWindow(null)
@@ -40,7 +99,8 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
-  registerIpc()
+  app.setAppUserModelId('com.dropletfiles.app')
+  registerIpc({ onActionsEnabledChange: setTrayRequired })
   createWindow()
 
   app.on('activate', () => {
@@ -48,6 +108,10 @@ app.whenReady().then(() => {
   })
 })
 
+app.on('before-quit', () => {
+  quitting = true
+})
+
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+  if (process.platform !== 'darwin' && !tray) app.quit()
 })

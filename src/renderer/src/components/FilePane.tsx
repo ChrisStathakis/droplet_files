@@ -18,6 +18,10 @@ interface Props {
   onDropPaths: (paths: string[]) => Promise<void>
   /** Files dropped from the operating system into this pane */
   onDropFiles: (files: string[]) => Promise<void>
+  /** Back up selected remote items (remote pane only) */
+  onBackup?: (paths: string[]) => void
+  /** Restore a backup to the server (local pane only) */
+  onRestore?: () => void
 }
 
 function entryIcon(entry: DirEntry): string {
@@ -33,7 +37,9 @@ export function FilePane({
   enabled,
   roots,
   onDropPaths,
-  onDropFiles
+  onDropFiles,
+  onBackup,
+  onRestore
 }: Props): React.ReactElement {
   const [selection, setSelection] = useState<Set<string>>(() => new Set())
   const [dragOver, setDragOver] = useState(false)
@@ -289,6 +295,39 @@ export function FilePane({
               if (e.key === 'Escape') setPathDraft(cwd)
             }}
           />
+          {onBackup && (
+            <button
+              className="btn btn-sm"
+              onClick={() => {
+                const names = selection.size > 0 ? [...selection] : []
+                const paths =
+                  names.length > 0
+                    ? names.map((name) => joinPath(side, cwd, name))
+                    : cwd
+                      ? [cwd]
+                      : []
+                if (paths.length > 0) onBackup(paths)
+              }}
+              disabled={!enabled || toolbarDisabled}
+              title={
+                selection.size > 0
+                  ? 'Back up selected items'
+                  : 'Back up this folder'
+              }
+            >
+              🗄 Backup
+            </button>
+          )}
+          {onRestore && (
+            <button
+              className="btn btn-sm"
+              onClick={onRestore}
+              disabled={!enabled}
+              title="Restore a backup to the server"
+            >
+              ♻ Restore
+            </button>
+          )}
           <button
             className="btn btn-sm"
             onClick={() => void createFolder()}

@@ -1,8 +1,26 @@
-import { dialog, ipcMain, type BrowserWindow, type OpenDialogOptions } from 'electron'
+import {
+  app,
+  clipboard,
+  dialog,
+  ipcMain,
+  shell,
+  type BrowserWindow,
+  type OpenDialogOptions
+} from 'electron'
+import { ActionManager } from './actions'
+import { BackupManager } from './backup'
 import { SshManager } from './ssh'
 import { Store } from './store'
 import { CH } from '../shared/channels'
-import type { ConnectInput, Profile, ShellOpenOptions, Side } from '../shared/types'
+import type {
+  ActionInput,
+  BackupCreateInput,
+  BackupRestoreInput,
+  ConnectInput,
+  Profile,
+  ShellOpenOptions,
+  Side
+} from '../shared/types'
 
 let win: BrowserWindow | null = null
 
@@ -14,7 +32,12 @@ function send(channel: string, payload: unknown): void {
   if (win && !win.isDestroyed()) win.webContents.send(channel, payload)
 }
 
-export function registerIpc(): void {
+export interface IpcCallbacks {
+  /** Lets the app keep a tray icon while scheduled actions are enabled */
+  onActionsEnabledChange?(hasEnabled: boolean): void
+}
+
+export function registerIpc(callbacks: IpcCallbacks = {}): void {
   const manager = new SshManager({
     status: (status) => send(CH.status, status),
     hostKey: (request) => send(CH.hostKeyRequest, request),
@@ -22,6 +45,22 @@ export function registerIpc(): void {
     shellData: (chunk) => send(CH.shellData, chunk),
     shellClosed: (event) => send(CH.shellClosed, event)
   })
+
+  const backups = new BackupManager({
+    ssh: manager,
+    appVersion: app.getVersion(),
+    events: { progress: (update) => send(CH.backupProgress, update) }
+  })
+
+  const actions = new ActionManager({
+    ssh: manager,
+    backups,
+    events: {
+      changed: (snapshot) => send(CH.actionsChanged, snapshot),
+      enabledChanged: (hasEnabled) => callbacks.onActionsEnabledChange?.(hasEnabled)
+    }
+  })
+  actions.start()
 
   // Connection
   ipcMain.handle(CH.connect, (_e, input: ConnectInput) => manager.connect(input))
@@ -60,6 +99,68 @@ export function registerIpc(): void {
     manager.resizeShell(cols, rows)
   )
   ipcMain.handle(CH.shellClose, () => manager.closeShell())
+
+  // Backups
+  ipcMain.handle(CH.backupCreate, async (_e, input: BackupCreateInput) => {
+    const summary = await backups.create(input)
+    Store.setBackupDir(input.destination)
+    return summary
+  })
+  ipcMain.handle(CH.backupInspect, (_e, backupDir: string) => backups.inspect(backupDir))
+  ipcMain.handle(CH.backupRestore, (_e, input: BackupRestoreInput) => backups.restore(input))
+  ipcMain.handle(CH.backupCancel, () => backups.cancel())
+  ipcMain.handle(CH.backupLastDestination, () => Store.getBackupDir() ?? null)
+  ipcMain.handle(CH.pickBackupDestination, async () => {
+    const options: OpenDialogOptions = {
+      title: 'Choose where to save the backup',
+      buttonLabel: 'Use this folder',
+      properties: ['openDirectory', 'createDirectory'],
+      defaultPath: Store.getBackupDir()
+    }
+    const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+    if (result.canceled || !result.filePaths[0]) return null
+    Store.setBackupDir(result.filePaths[0])
+    return result.filePaths[0]
+  })
+  ipcMain.handle(CH.pickBackupFolder, async () => {
+    const options: OpenDialogOptions = {
+      title: 'Select a backup folder',
+      buttonLabel: 'Open backup',
+      properties: ['openDirectory'],
+      defaultPath: Store.getBackupDir()
+    }
+    const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+    return result.canceled ? null : result.filePaths[0] ?? null
+  })
+
+  // Help / app info
+  ipcMain.handle(CH.appInfo, () => ({
+    name: app.getName(),
+    version: app.getVersion(),
+    electron: process.versions.electron ?? '',
+    platform: process.platform
+  }))
+
+  // Scheduled actions
+  ipcMain.handle(CH.actionsList, () => actions.snapshot())
+  ipcMain.handle(CH.actionsSave, (_e, input: ActionInput & { id?: string }) => actions.save(input))
+  ipcMain.handle(CH.actionsDelete, (_e, id: string) => actions.remove(id))
+  ipcMain.handle(CH.actionsSetEnabled, (_e, id: string, enabled: boolean) =>
+    actions.setEnabled(id, enabled)
+  )
+  ipcMain.handle(CH.actionsRunNow, (_e, id: string) => actions.runAction(id, 'manual'))
+  ipcMain.handle(CH.actionsCancelRun, () => actions.cancelRun())
+  ipcMain.handle(CH.actionsDeleteBackup, (_e, runId: string) => actions.deleteBackup(runId))
+  ipcMain.handle(CH.actionsOpenFolder, async (_e, dir: string) => {
+    const message = await shell.openPath(dir)
+    if (message) throw new Error(message)
+  })
+
+  // Clipboard for the terminal right-click menu
+  ipcMain.handle(CH.clipboardReadText, () => clipboard.readText())
+  ipcMain.handle(CH.clipboardWriteText, (_e, text: string) => {
+    if (typeof text === 'string') clipboard.writeText(text)
+  })
 
   // Profiles
   ipcMain.handle(CH.profilesList, (): Profile[] =>

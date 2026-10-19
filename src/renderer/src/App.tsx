@@ -1,19 +1,29 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type {
+  BackupInspection,
   ConnectionStatus,
   HostKeyRequest,
   Profile,
   Side,
   TransferUpdate
 } from '@shared/types'
+import { AboutDialog } from './components/AboutDialog'
+import { ActionsDialog } from './components/ActionsDialog'
+import { BackupDialog } from './components/BackupDialog'
 import { ConnectionBar, emptyForm, type ConnectionForm } from './components/ConnectionBar'
 import { FilePane } from './components/FilePane'
 import { HostKeyDialog } from './components/HostKeyDialog'
+import { RestoreDialog } from './components/RestoreDialog'
 import { TerminalDrawer } from './components/TerminalDrawer'
 import { TransferQueue } from './components/TransferQueue'
 import { useDialogs } from './dialogs'
 import { errorMessage } from './format'
 import { usePane } from './usePane'
+
+type BackupUi =
+  | { kind: 'create'; paths: string[] }
+  | { kind: 'restore'; inspection: BackupInspection }
+  | null
 
 export default function App(): React.ReactElement {
   const [status, setStatus] = useState<ConnectionStatus>({ state: 'disconnected' })
@@ -25,6 +35,9 @@ export default function App(): React.ReactElement {
   const [connectError, setConnectError] = useState<string | null>(null)
   const [roots, setRoots] = useState<string[]>([])
   const [terminalOpen, setTerminalOpen] = useState(false)
+  const [backupUi, setBackupUi] = useState<BackupUi>(null)
+  const [aboutOpen, setAboutOpen] = useState(false)
+  const [actionsOpen, setActionsOpen] = useState(false)
 
   const localPane = usePane('local')
   const remotePane = usePane('remote')
@@ -202,6 +215,19 @@ export default function App(): React.ReactElement {
     if (picked) setForm((f) => ({ ...f, keyPath: picked }))
   }
 
+  // ------------------------------------------------------------------- backups
+
+  const handleOpenRestore = async (): Promise<void> => {
+    try {
+      const folder = await window.api.pickBackupFolder()
+      if (!folder) return
+      const inspection = await window.api.backupInspect(folder)
+      setBackupUi({ kind: 'restore', inspection })
+    } catch (err) {
+      localPane.fail(errorMessage(err))
+    }
+  }
+
   // ----------------------------------------------------------------- transfers
 
   const connected = status.state === 'connected'
@@ -264,6 +290,8 @@ export default function App(): React.ReactElement {
         onPickKey={() => void handlePickKey()}
         terminalOpen={terminalOpen}
         onToggleTerminal={() => setTerminalOpen((open) => !open)}
+        onActions={() => setActionsOpen(true)}
+        onHelp={() => setAboutOpen(true)}
       />
 
       <main className="panes">
@@ -275,6 +303,7 @@ export default function App(): React.ReactElement {
           roots={roots}
           onDropPaths={downloadInto}
           onDropFiles={copyInto}
+          onRestore={connected ? () => void handleOpenRestore() : undefined}
         />
         <FilePane
           side={'remote' as Side}
@@ -284,6 +313,11 @@ export default function App(): React.ReactElement {
           roots={[]}
           onDropPaths={uploadInto}
           onDropFiles={uploadInto}
+          onBackup={
+            connected
+              ? (paths) => setBackupUi({ kind: 'create', paths })
+              : undefined
+          }
         />
       </main>
 
@@ -303,6 +337,25 @@ export default function App(): React.ReactElement {
           )
         }
       />
+
+      {backupUi?.kind === 'create' && (
+        <BackupDialog remotePaths={backupUi.paths} onClose={() => setBackupUi(null)} />
+      )}
+      {backupUi?.kind === 'restore' && (
+        <RestoreDialog
+          inspection={backupUi.inspection}
+          currentConnectionLabel={status.message}
+          defaultRemoteDir={remotePane.cwd}
+          onClose={() => setBackupUi(null)}
+          onCompleted={() => void remotePane.refresh()}
+        />
+      )}
+
+      {aboutOpen && <AboutDialog onClose={() => setAboutOpen(false)} />}
+
+      {actionsOpen && (
+        <ActionsDialog profiles={profiles} onClose={() => setActionsOpen(false)} />
+      )}
 
       {hostKeyReq && (
         <HostKeyDialog request={hostKeyReq} onRespond={(t) => void handleHostKeyResponse(t)} />

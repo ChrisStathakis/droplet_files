@@ -11,8 +11,13 @@ interface StoredProfile extends Profile {
 
 type TrustedHosts = Record<string, string>
 
+interface Settings {
+  backupDir?: string
+}
+
 const PROFILES_FILE = 'profiles.json'
 const HOSTS_FILE = 'trusted-hosts.json'
+const SETTINGS_FILE = 'settings.json'
 
 function dataFile(name: string): string {
   const dir = app.getPath('userData')
@@ -109,5 +114,18 @@ export const Store = {
     const hosts = readJson<TrustedHosts>(HOSTS_FILE, {})
     hosts[hostPort] = fingerprint
     writeJson(HOSTS_FILE, hosts)
+  },
+
+  // App settings
+
+  getBackupDir(): string | undefined {
+    const value = readJson<Settings>(SETTINGS_FILE, {}).backupDir
+    return typeof value === 'string' && value.length > 0 ? value : undefined
+  },
+
+  setBackupDir(dir: string): void {
+    const settings = readJson<Settings>(SETTINGS_FILE, {})
+    settings.backupDir = dir
+    writeJson(SETTINGS_FILE, settings)
   }
 }

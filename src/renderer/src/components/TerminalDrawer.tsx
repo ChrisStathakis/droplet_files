@@ -29,8 +29,10 @@ export function TerminalDrawer({ visible, title, onClose }: Props): React.ReactE
   const shellOpenRef = useRef(false)
   const shellOpeningRef = useRef(false)
   const shellAttemptRef = useRef(0)
+  const menuRef = useRef<HTMLDivElement>(null)
   const [height, setHeight] = useState(DEFAULT_HEIGHT)
   const [shellState, setShellState] = useState<'closed' | 'opening' | 'open'>('closed')
+  const [menu, setMenu] = useState<{ x: number; y: number; canCopy: boolean } | null>(null)
 
   /** Re-measures the container; never fits a hidden (zero-size) drawer */
   const fit = useCallback(() => {
@@ -43,6 +45,39 @@ export function TerminalDrawer({ visible, title, onClose }: Props): React.ReactE
       /* mid-layout or already disposed */
     }
   }, [visible])
+
+  const copySelection = useCallback((): void => {
+    const text = termRef.current?.getSelection() ?? ''
+    if (text) void window.api.clipboardWriteText(text).catch(() => undefined)
+    setMenu(null)
+    termRef.current?.focus()
+  }, [])
+
+  const pasteClipboard = useCallback((): void => {
+    void (async () => {
+      try {
+        const text = await window.api.clipboardReadText()
+        if (text) termRef.current?.paste(text)
+      } catch (err) {
+        termRef.current?.write(`\r\n\x1b[31m${errorMessage(err)}\x1b[0m\r\n`)
+      } finally {
+        setMenu(null)
+        termRef.current?.focus()
+      }
+    })()
+  }, [])
+
+  const selectAll = useCallback((): void => {
+    termRef.current?.selectAll()
+    setMenu(null)
+    termRef.current?.focus()
+  }, [])
+
+  const clearTerminal = useCallback((): void => {
+    termRef.current?.clear()
+    setMenu(null)
+    termRef.current?.focus()
+  }, [])
 
   const openShell = useCallback(async (): Promise<void> => {
     const term = termRef.current
@@ -91,6 +126,18 @@ export function TerminalDrawer({ visible, title, onClose }: Props): React.ReactE
       })
       term.onResize(({ cols, rows }) => {
         void window.api.shellResize(cols, rows).catch(() => {})
+      })
+      term.attachCustomKeyEventHandler((e) => {
+        if (e.type !== 'keydown') return true
+        if (e.ctrlKey && e.shiftKey && (e.key === 'C' || e.key === 'c')) {
+          copySelection()
+          return false
+        }
+        if (e.ctrlKey && e.shiftKey && (e.key === 'V' || e.key === 'v')) {
+          pasteClipboard()
+          return false
+        }
+        return true
       })
     }
     void openShell()
@@ -149,6 +196,34 @@ export function TerminalDrawer({ visible, title, onClose }: Props): React.ReactE
     return () => observer.disconnect()
   }, [visible, fit])
 
+  // Close the terminal context menu on outside clicks, Escape, scroll, or resize
+  useEffect(() => {
+    if (!menu) return
+    const onPointerDown = (e: MouseEvent): void => {
+      if (menuRef.current && e.target instanceof Node && menuRef.current.contains(e.target)) {
+        return
+      }
+      setMenu(null)
+    }
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') {
+        e.stopPropagation()
+        setMenu(null)
+      }
+    }
+    const close = (): void => setMenu(null)
+    window.addEventListener('mousedown', onPointerDown)
+    window.addEventListener('keydown', onKey)
+    window.addEventListener('blur', close)
+    window.addEventListener('resize', close)
+    return () => {
+      window.removeEventListener('mousedown', onPointerDown)
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('blur', close)
+      window.removeEventListener('resize', close)
+    }
+  }, [menu])
+
   const startDrag = (e: React.MouseEvent): void => {
     e.preventDefault()
     const startY = e.clientY
@@ -193,7 +268,44 @@ export function TerminalDrawer({ visible, title, onClose }: Props): React.ReactE
           ✕
         </button>
       </div>
-      <div className="terminal-body" ref={bodyRef} />
+      <div
+        className="terminal-body"
+        ref={bodyRef}
+        title="Right-click for copy/paste (Ctrl+Shift+C / Ctrl+Shift+V)"
+        onContextMenu={(e) => {
+          e.preventDefault()
+          if (!termRef.current) return
+          setMenu({
+            x: e.clientX,
+            y: e.clientY,
+            canCopy: termRef.current.hasSelection()
+          })
+        }}
+      />
+      {menu && (
+        <div
+          className="terminal-menu"
+          ref={menuRef}
+          role="menu"
+          style={{
+            left: Math.max(6, Math.min(menu.x, window.innerWidth - 170)),
+            top: Math.max(6, Math.min(menu.y, window.innerHeight - 150))
+          }}
+        >
+          <button role="menuitem" disabled={!menu.canCopy} onClick={copySelection}>
+            Copy
+          </button>
+          <button role="menuitem" onClick={pasteClipboard}>
+            Paste
+          </button>
+          <button role="menuitem" onClick={selectAll}>
+            Select all
+          </button>
+          <button role="menuitem" onClick={clearTerminal}>
+            Clear
+          </button>
+        </div>
+      )}
     </section>
   )
 }

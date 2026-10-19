@@ -20,6 +20,8 @@ import { Transform } from 'stream'
 import { pipeline } from 'stream/promises'
 import { Store } from './store'
 import type {
+  BackupConflictPolicy,
+  BackupConnectionInfo,
   ConnectInput,
   ConnectionStatus,
   DirEntry,
@@ -44,6 +46,38 @@ type Callback<T> = (err: Error | undefined, result: T) => void
 interface TransferSession {
   sftp: SFTPWrapper
   generation: number
+}
+
+export interface RemoteStatInfo {
+  isDir: boolean
+  isFile: boolean
+  isSymlink: boolean
+  size: number
+  mtime: number
+  mode: number
+}
+
+export interface BackupDownloadResult {
+  size: number
+  mtime: number
+  mode: number
+  sha256: string
+}
+
+export interface RestoreUploadOptions {
+  policy: BackupConflictPolicy
+  /** Expected SHA-256 of the local source, verified while uploading */
+  sha256?: string
+  mode?: number
+  mtime?: number
+  signal?: AbortSignal
+  /** The SSH connection this restore is pinned to */
+  expectedGeneration?: number
+}
+
+export interface RestoreUploadResult {
+  outcome: 'restored' | 'skipped' | 'renamed'
+  finalPath: string
 }
 
 function promisify<T>(fn: (cb: Callback<T>) => void): Promise<T> {
@@ -93,6 +127,11 @@ function sftpExists(sftp: SFTPWrapper, p: string): Promise<boolean> {
   return new Promise((resolve) => sftp.stat(p, (err) => resolve(!err)))
 }
 
+/** Like sftpExists, but does not follow symlinks (detects dangling links too) */
+function sftpLexists(sftp: SFTPWrapper, p: string): Promise<boolean> {
+  return new Promise((resolve) => sftp.lstat(p, (err) => resolve(!err)))
+}
+
 const PROGRESS_INTERVAL_MS = 100
 
 export class SshManager {
@@ -105,8 +144,18 @@ export class SshManager {
   private lock: Promise<unknown> = Promise.resolve()
   private transferSeq = 0
   private status: ConnectionStatus = { state: 'disconnected' }
+  private connectionInfo: BackupConnectionInfo | null = null
 
   constructor(private events: SshEvents) {}
+
+  getConnectionInfo(): BackupConnectionInfo | null {
+    return this.connectionInfo
+  }
+
+  /** Bumped on every connect attempt; multi-file jobs pin themselves to one value. */
+  getConnectionGeneration(): number {
+    return this.connectionGeneration
+  }
 
   private setStatus(state: ConnectionStatus['state'], message?: string): void {
     this.status = { state, message }
@@ -205,6 +254,11 @@ export class SshManager {
       this.assertConnectionAttempt(generation)
       this.sftp = sftp
       this.connectAbort = null
+      this.connectionInfo = {
+        host: input.host,
+        port: input.port,
+        username: input.username
+      }
       this.setStatus('connected', label)
     } catch (err) {
       if (generation === this.connectionGeneration) {
@@ -236,6 +290,7 @@ export class SshManager {
     const client = this.client
     this.client = null
     this.sftp = null
+    this.connectionInfo = null
     if (client) {
       try {
         client.end()
@@ -252,6 +307,7 @@ export class SshManager {
   private handleUnexpectedClose(message?: string): void {
     this.client = null
     this.sftp = null
+    this.connectionInfo = null
     this.endShell(message)
     this.rejectPendingHostKeys()
     this.setStatus('disconnected', message || undefined)
@@ -419,9 +475,20 @@ export class SshManager {
     )
   }
 
-  async listRemote(dir: string): Promise<DirListing> {
-    const sftp = this.requireSftp()
-    const list = await promisify<FileEntryWithStats[]>((cb) => sftp.readdir(dir, cb))
+  private assertGeneration(expected: number | undefined, message: string): void {
+    if (expected !== undefined && expected !== this.connectionGeneration) {
+      throw new Error(message)
+    }
+  }
+
+  async listRemote(dir: string, expectedGeneration?: number): Promise<DirListing> {
+    this.assertGeneration(
+      expectedGeneration,
+      'Connection changed while reading the server; the operation was stopped'
+    )
+    const session = this.captureTransferSession()
+    const list = await promisify<FileEntryWithStats[]>((cb) => session.sftp.readdir(dir, cb))
+    this.assertTransferSession(session)
     const entries: DirEntry[] = list
       .filter((e) => e.filename !== '.' && e.filename !== '..')
       .map((e) => ({
@@ -579,6 +646,285 @@ export class SshManager {
         }
       }
     }
+  }
+
+  // ------------------------------------------------------------------ backups
+
+  async lstatRemote(target: string, expectedGeneration?: number): Promise<RemoteStatInfo> {
+    this.assertGeneration(
+      expectedGeneration,
+      'Connection changed while reading the server; the operation was stopped'
+    )
+    const session = this.captureTransferSession()
+    const st = await promisify<Stats>((cb) => session.sftp.lstat(target, cb))
+    this.assertTransferSession(session)
+    return {
+      isDir: st.isDirectory(),
+      isFile: st.isFile(),
+      isSymlink: st.isSymbolicLink(),
+      size: st.size,
+      mtime: st.mtime,
+      mode: st.mode
+    }
+  }
+
+  /** Creates a remote directory and any missing parents (like `mkdir -p`) */
+  async mkdirpRemote(dir: string, expectedGeneration?: number): Promise<void> {
+    this.assertGeneration(
+      expectedGeneration,
+      'Connection changed during restore; the restore was stopped'
+    )
+    const sftp = this.requireSftp()
+    const normalized = path.posix.normalize(dir)
+    let current = normalized.startsWith('/') ? '/' : ''
+
+    for (const segment of normalized.split('/')) {
+      if (!segment || segment === '.') continue
+      this.assertGeneration(
+        expectedGeneration,
+        'Connection changed during restore; the restore was stopped'
+      )
+      current = current === '' ? segment : current === '/' ? `/${segment}` : `${current}/${segment}`
+
+      if (await sftpExists(sftp, current)) {
+        // stat (not lstat) so a symlink pointing at a directory is accepted.
+        const st = await promisify<Stats>((cb) => sftp.stat(current, cb))
+        if (!st.isDirectory()) throw new Error(`Not a directory: ${current}`)
+        continue
+      }
+      try {
+        await sftpCall((done) => sftp.mkdir(current, done))
+      } catch (err) {
+        // Another client may have created it between the check and the mkdir.
+        const st = await promisify<Stats>((cb) => sftp.stat(current, cb)).catch(() => null)
+        if (!st?.isDirectory()) throw err
+      }
+    }
+  }
+
+  /** Best-effort chmod/utimes used by restore; metadata failures are ignored */
+  async applyRemoteMetadata(
+    target: string,
+    mode?: number,
+    mtime?: number,
+    expectedGeneration?: number
+  ): Promise<void> {
+    this.assertGeneration(
+      expectedGeneration,
+      'Connection changed during restore; the restore was stopped'
+    )
+    const sftp = this.requireSftp()
+    await this.applyMetadata(sftp, target, mode, mtime)
+  }
+
+  private async applyMetadata(
+    sftp: SFTPWrapper,
+    target: string,
+    mode?: number,
+    mtime?: number
+  ): Promise<void> {
+    if (mode !== undefined) {
+      await sftpCall((done) => sftp.chmod(target, mode & 0o7777, done)).catch(() => undefined)
+    }
+    if (mtime !== undefined) {
+      await sftpCall((done) => sftp.utimes(target, mtime, mtime, done)).catch(() => undefined)
+    }
+  }
+
+  /** Exact-path recursive file download used by backups (no collision suffixing) */
+  async downloadBackupFile(
+    remotePath: string,
+    localPath: string,
+    signal?: AbortSignal,
+    expectedGeneration?: number
+  ): Promise<BackupDownloadResult> {
+    this.assertGeneration(
+      expectedGeneration,
+      'Connection changed during backup; the backup was stopped'
+    )
+    const session = this.captureTransferSession()
+    return this.withLock(async () => {
+      this.assertTransferSession(session)
+      this.assertGeneration(
+        expectedGeneration,
+        'Connection changed during backup; the backup was stopped'
+      )
+      const id = String(++this.transferSeq)
+      const name = path.posix.basename(remotePath)
+      let total = 0
+      let transferred = 0
+
+      try {
+        const st = await promisify<Stats>((cb) => session.sftp.lstat(remotePath, cb))
+        if (!st.isFile()) throw new Error(`Not a regular file: ${remotePath}`)
+        total = st.size
+        this.emitTransfer({ id, name, direction: 'down', state: 'queued', transferred: 0, total })
+        this.emitTransfer({ id, name, direction: 'down', state: 'active', transferred: 0, total })
+
+        const hash = createHash('sha256')
+        const hasher = new Transform({
+          transform: (chunk: Buffer, _enc, cb) => {
+            hash.update(chunk)
+            cb(null, chunk)
+          }
+        })
+        const source = session.sftp.createReadStream(remotePath)
+        const counter = this.counter(id, name, 'down', total, (count) => (transferred = count))
+        const dest = createWriteStream(localPath, { flags: 'wx' })
+        await pipeline(source, hasher, counter, dest, { signal })
+
+        this.emitTransfer({
+          id,
+          name,
+          direction: 'down',
+          state: 'done',
+          transferred,
+          total: transferred
+        })
+        return {
+          size: transferred,
+          mtime: st.mtime,
+          mode: st.mode,
+          sha256: hash.digest('hex')
+        }
+      } catch (err) {
+        const message = signal?.aborted ? 'Backup cancelled' : errmsg(err)
+        this.emitTransfer({
+          id,
+          name,
+          direction: 'down',
+          state: 'error',
+          transferred,
+          total,
+          error: message
+        })
+        throw err
+      }
+    })
+  }
+
+  /** Uploads one restored file with the requested conflict policy */
+  async uploadBackupFile(
+    localPath: string,
+    remoteDir: string,
+    name: string,
+    options: RestoreUploadOptions
+  ): Promise<RestoreUploadResult> {
+    this.assertGeneration(
+      options.expectedGeneration,
+      'Connection changed during restore; the restore was stopped'
+    )
+    const session = this.captureTransferSession()
+    return this.withLock(async () => {
+      this.assertTransferSession(session)
+      this.assertGeneration(
+        options.expectedGeneration,
+        'Connection changed during restore; the restore was stopped'
+      )
+      const sftp = session.sftp
+      const originalTarget = path.posix.join(remoteDir, name)
+      const exists = await sftpLexists(sftp, originalTarget)
+
+      if (exists && options.policy === 'skip') {
+        return { outcome: 'skipped', finalPath: originalTarget }
+      }
+
+      let target = originalTarget
+      let renamed = false
+      if (exists && options.policy === 'keep-both') {
+        const unique = await uniqueName(
+          remoteDir,
+          name,
+          (d, n) => path.posix.join(d, n),
+          (p) => sftpLexists(sftp, p)
+        )
+        target = path.posix.join(remoteDir, unique)
+        renamed = unique !== name
+      } else if (exists && options.policy === 'overwrite') {
+        const st = await promisify<Stats>((cb) => sftp.lstat(originalTarget, cb))
+        if (st.isDirectory()) {
+          throw new Error(`Cannot overwrite directory with a file: ${originalTarget}`)
+        }
+      }
+
+      const id = String(++this.transferSeq)
+      let total = 0
+      let transferred = 0
+      let tempPath: string | null = null
+      let previousPath: string | null = null
+
+      try {
+        const st = await fsp.lstat(localPath)
+        if (!st.isFile() || st.isSymbolicLink()) {
+          throw new Error(`Not a regular file: ${localPath}`)
+        }
+        total = st.size
+        this.emitTransfer({ id, name, direction: 'up', state: 'queued', transferred: 0, total })
+        this.emitTransfer({ id, name, direction: 'up', state: 'active', transferred: 0, total })
+
+        tempPath = path.posix.join(remoteDir, `.droplet-${randomUUID()}.part`)
+        const hash = createHash('sha256')
+        const hasher = new Transform({
+          transform: (chunk: Buffer, _enc, cb) => {
+            hash.update(chunk)
+            cb(null, chunk)
+          }
+        })
+        const source = createReadStream(localPath)
+        const counter = this.counter(id, name, 'up', total, (count) => (transferred = count))
+        const dest = sftp.createWriteStream(tempPath, { flags: 'wx' })
+        await pipeline(source, hasher, counter, dest, { signal: options.signal })
+
+        if (options.sha256 && hash.digest('hex') !== options.sha256) {
+          throw new Error(`Checksum mismatch for ${name}`)
+        }
+
+        this.assertTransferSession(session)
+        if (exists && options.policy === 'overwrite') {
+          // Move the old file aside first so a failed rename cannot lose it.
+          previousPath = path.posix.join(remoteDir, `.droplet-old-${randomUUID()}.part`)
+          await sftpCall((done) => sftp.rename(originalTarget, previousPath!, done))
+        }
+        await sftpCall((done) => sftp.rename(tempPath!, target, done))
+        tempPath = null
+        if (previousPath) {
+          await sftpCall((done) => sftp.unlink(previousPath!, done)).catch(() => undefined)
+          previousPath = null
+        }
+        await this.applyMetadata(sftp, target, options.mode, options.mtime)
+        this.emitTransfer({ id, name, direction: 'up', state: 'done', transferred: total, total })
+        return {
+          outcome: renamed ? 'renamed' : 'restored',
+          finalPath: target
+        }
+      } catch (err) {
+        const message = options.signal?.aborted ? 'Restore cancelled' : errmsg(err)
+        if (previousPath && this.isCurrentTransferSession(session)) {
+          try {
+            // If the new file never made it into place, put the old one back.
+            if (!(await sftpExists(sftp, target))) {
+              await sftpCall((done) => sftp.rename(previousPath!, target, done))
+              previousPath = null
+            }
+          } catch {
+            /* leave the old file at its temporary path rather than deleting it */
+          }
+        }
+        if (tempPath && this.isCurrentTransferSession(session)) {
+          await sftpCall((done) => sftp.unlink(tempPath!, done)).catch(() => undefined)
+        }
+        this.emitTransfer({
+          id,
+          name,
+          direction: 'up',
+          state: 'error',
+          transferred,
+          total,
+          error: message
+        })
+        throw err
+      }
+    })
   }
 
   // ----------------------------------------------------------------- transfers

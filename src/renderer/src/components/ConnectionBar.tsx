@@ -35,6 +35,8 @@ interface Props {
   onDeleteProfile: () => void
   onPickKey: () => void
   onToggleTerminal: () => void
+  onActions: () => void
+  onHelp: () => void
 }
 
 export function ConnectionBar({
@@ -51,7 +53,9 @@ export function ConnectionBar({
   onSaveProfile,
   onDeleteProfile,
   onPickKey,
-  onToggleTerminal
+  onToggleTerminal,
+  onActions,
+  onHelp
 }: Props): React.ReactElement {
   const connected = status.state === 'connected'
   const busy = status.state === 'connecting'
@@ -102,6 +106,18 @@ export function ConnectionBar({
           title="Toggle the droplet terminal (Ctrl+`)"
         >
           ⌨ Terminal
+        </button>
+
+        <button
+          className="btn"
+          onClick={onActions}
+          title="Scheduled backups (every X hours/days/weeks)"
+        >
+          ⏱ Actions
+        </button>
+
+        <button className="btn" onClick={onHelp} title="Help and app version">
+          ? Help
         </button>
 
         <span className={`status status-${status.state}`} title={status.message}>

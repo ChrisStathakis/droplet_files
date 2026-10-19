@@ -315,7 +315,8 @@ function wireSftp(sftp, mem) {
     .on('SETSTAT', (reqid, p, attrs) => {
       const node = mem.get(mem.normalize(p))
       if (!node) return nofile(reqid)
-      if (attrs.mode !== undefined) node.mode = attrs.mode
+      // chmod supplies permission bits only; keep the node type bits intact
+      if (attrs.mode !== undefined) node.mode = (node.mode & 0o170000) | (attrs.mode & 0o7777)
       if (attrs.mtime !== undefined) node.mtime = attrs.mtime * 1000
       if (attrs.atime !== undefined) node.atime = attrs.atime * 1000
       if (node.type === 'file' && attrs.size !== undefined) {
@@ -399,6 +400,21 @@ async function main() {
   })
   const { Store } = require(storeBundle)
 
+  const backupBundle = path.join(tmp, 'backup.bundle.cjs')
+  await build({
+    entryPoints: [abs('src/main/backup.ts')],
+    bundle: true,
+    platform: 'node',
+    format: 'cjs',
+    external: ['ssh2'],
+    alias: { electron: abs('scripts/electron-stub.cjs') },
+    outfile: backupBundle,
+    logLevel: 'warning'
+  })
+  check('esbuild bundled src/main/backup.ts', fs.existsSync(backupBundle))
+  const { BackupManager } = require(backupBundle)
+  check('BackupManager exported', typeof BackupManager === 'function')
+
   section('saved passphrase preference')
   const savedProfile = Store.saveProfile(
     {
@@ -414,6 +430,218 @@ async function main() {
   check('remembered passphrase is available while enabled', Store.getPassphrase(savedProfile.id) === 'test secret')
   Store.saveProfile({ ...savedProfile, rememberPassphrase: false })
   check('disabling remember removes the stored passphrase', Store.getPassphrase(savedProfile.id) === undefined)
+
+  // Scheduled actions --------------------------------------------------------
+  section('scheduled actions')
+  const actionsBundle = path.join(tmp, 'actions.bundle.cjs')
+  await build({
+    entryPoints: [abs('src/main/actions.ts')],
+    bundle: true,
+    platform: 'node',
+    format: 'cjs',
+    alias: { electron: abs('scripts/electron-stub.cjs') },
+    outfile: actionsBundle,
+    logLevel: 'warning'
+  })
+  check('esbuild bundled src/main/actions.ts', fs.existsSync(actionsBundle))
+  const { ActionManager } = require(actionsBundle)
+  check('ActionManager exported', typeof ActionManager === 'function')
+
+  const actionChanges = []
+  const actionCalls = []
+  let connectCount = 0
+  let disconnectCount = 0
+  const fakeSsh = {
+    connected: true,
+    generation: 1,
+    getConnectionInfo() {
+      return fakeSsh.connected
+        ? { host: 'example.invalid', port: 22, username: 'tester' }
+        : null
+    },
+    isConnected() {
+      return fakeSsh.connected
+    },
+    getConnectionGeneration() {
+      return fakeSsh.generation
+    },
+    async connect() {
+      connectCount++
+      fakeSsh.generation++
+      fakeSsh.connected = true
+    },
+    async disconnect() {
+      disconnectCount++
+      fakeSsh.generation++
+      fakeSsh.connected = false
+    }
+  }
+  const fakeBackups = {
+    busy: false,
+    fail: false,
+    nextDir: null,
+    isBusy() {
+      return fakeBackups.busy
+    },
+    async create(input) {
+      actionCalls.push(input)
+      if (fakeBackups.fail) throw new Error('simulated backup failure')
+      const backupDir = fakeBackups.nextDir || path.join(input.destination, input.name)
+      return { backupDir, manifest: { totals: { files: 2, dirs: 1, bytes: 1234 } } }
+    }
+  }
+  const newActionManager = () =>
+    new ActionManager({
+      ssh: fakeSsh,
+      backups: fakeBackups,
+      events: { changed: (snapshot) => actionChanges.push(snapshot) }
+    })
+
+  let actionsManager = newActionManager()
+  actionsManager.start()
+  actionsManager.stop()
+  check('ActionManager starts with no saved actions', actionsManager.snapshot().actions.length === 0)
+
+  const actionDest = path.join(tmp, 'action-dest')
+  fs.mkdirSync(actionDest, { recursive: true })
+  let badPathRejected = false
+  try {
+    actionsManager.save({
+      label: 'Bad paths',
+      profileId: savedProfile.id,
+      remotePaths: ['relative/path'],
+      destination: actionDest,
+      intervalValue: 3,
+      intervalUnit: 'days',
+      timeOfDay: null,
+      enabled: true,
+      catchUp: true
+    })
+  } catch {
+    badPathRejected = true
+  }
+  check('relative remote paths are rejected', badPathRejected)
+
+  const actionSnapshot = actionsManager.save({
+    label: 'E2E site',
+    profileId: savedProfile.id,
+    remotePaths: ['/var/www'],
+    destination: actionDest,
+    intervalValue: 3,
+    intervalUnit: 'days',
+    timeOfDay: '03:00',
+    enabled: true,
+    catchUp: true
+  })
+  const savedAction = actionSnapshot.actions[0]
+  check('scheduled action saved', savedAction?.label === 'E2E site')
+  check('first run is scheduled in the future', Date.parse(savedAction.nextRunAt) > Date.now())
+  check(
+    'actions.json was written',
+    JSON.parse(fs.readFileSync(path.join(USERDATA, 'actions.json'), 'utf8')).actions.length === 1
+  )
+
+  actionsManager = newActionManager()
+  actionsManager.start()
+  actionsManager.stop()
+  check(
+    'actions survive a manager restart',
+    actionsManager.snapshot().actions[0]?.id === savedAction.id
+  )
+
+  fakeBackups.busy = true
+  await actionsManager.runAction(savedAction.id, 'schedule')
+  const deferred = actionsManager.snapshot().actions[0]
+  check('a busy app defers scheduled runs', Date.parse(deferred.nextRunAt) - Date.now() > 4 * 60_000)
+  check('a deferred run does not create a backup', actionCalls.length === 0)
+  let busyRejected = false
+  try {
+    await actionsManager.runAction(savedAction.id, 'manual')
+  } catch {
+    busyRejected = true
+  }
+  check('manual runs are rejected while another backup is active', busyRejected)
+  fakeBackups.busy = false
+
+  actionCalls.length = 0
+  await actionsManager.runAction(savedAction.id, 'manual')
+  let view = actionsManager.snapshot()
+  check('manual action run succeeds', view.history[0]?.status === 'success')
+  check('manual run records files and bytes', view.history[0]?.files === 2 && view.history[0]?.bytes === 1234)
+  check('manual run uses the configured paths', actionCalls[0]?.remotePaths?.[0] === '/var/www')
+  check('manual run name is timestamped', /^E2E site_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}$/.test(actionCalls[0]?.name))
+  check('manual run updates lastRunAt', view.actions[0]?.lastRunAt !== null)
+  check('next run is in the future after a run', Date.parse(view.actions[0].nextRunAt) > Date.now())
+
+  fakeSsh.connected = false
+  const connectsBefore = connectCount
+  const disconnectsBefore = disconnectCount
+  actionCalls.length = 0
+  await actionsManager.runAction(savedAction.id, 'manual')
+  check('an action connects when the app is disconnected', connectCount === connectsBefore + 1)
+  check(
+    'an owned connection is closed after the run',
+    disconnectCount === disconnectsBefore + 1 && fakeSsh.connected === false
+  )
+  check('the connected run still backed up', actionCalls.length === 1)
+
+  fakeBackups.fail = true
+  await actionsManager.runAction(savedAction.id, 'schedule')
+  fakeBackups.fail = false
+  view = actionsManager.snapshot()
+  check('scheduled failure is recorded', view.history[0]?.status === 'failed')
+  const retryDelay = Date.parse(view.actions[0].nextRunAt) - Date.now()
+  check(
+    'scheduled failure retries in about 10 minutes',
+    retryDelay > 9 * 60_000 && retryDelay <= 10 * 60_000 + 10_000
+  )
+  check('retry message is shown', /retrying in 10 minutes/i.test(view.actions[0].lastError ?? ''))
+
+  fakeBackups.fail = true
+  let manualFailed = false
+  try {
+    await actionsManager.runAction(savedAction.id, 'manual')
+  } catch {
+    manualFailed = true
+  }
+  fakeBackups.fail = false
+  check('manual failure rejects for the UI', manualFailed)
+
+  const actionBackupDir = path.join(actionDest, 'E2E site_delete-me')
+  fs.mkdirSync(actionBackupDir, { recursive: true })
+  fs.writeFileSync(path.join(actionBackupDir, 'backup-manifest.json'), '{}', 'utf8')
+  fakeBackups.nextDir = actionBackupDir
+  await actionsManager.runAction(savedAction.id, 'manual')
+  fakeBackups.nextDir = null
+  view = actionsManager.snapshot()
+  const deleteRun = view.history[0]
+  check('successful run points at its backup folder', deleteRun.backupDir === actionBackupDir)
+  actionsManager.deleteBackup(deleteRun.id)
+  view = actionsManager.snapshot()
+  check('deleting a backup removes the folder', !fs.existsSync(actionBackupDir))
+  check('deleting a backup clears the history link', view.history[0]?.backupDir === null)
+
+  const outside = path.join(tmp, 'outside-backup')
+  fs.mkdirSync(outside, { recursive: true })
+  fs.writeFileSync(path.join(outside, 'backup-manifest.json'), '{}', 'utf8')
+  fakeBackups.nextDir = outside
+  await actionsManager.runAction(savedAction.id, 'manual')
+  fakeBackups.nextDir = null
+  view = actionsManager.snapshot()
+  let refusedOutside = false
+  try {
+    actionsManager.deleteBackup(view.history[0].id)
+  } catch {
+    refusedOutside = true
+  }
+  check('deleting a folder outside the destination is refused', refusedOutside && fs.existsSync(outside))
+  fs.rmSync(outside, { recursive: true, force: true })
+
+  const paused = actionsManager.setEnabled(savedAction.id, false).actions[0]
+  check('paused actions have no next run', paused.enabled === false && paused.nextRunAt === null)
+  const resumed = actionsManager.setEnabled(savedAction.id, true).actions[0]
+  check('enabling an action schedules it again', Date.parse(resumed.nextRunAt) > Date.now())
+  actionsManager.stop()
 
   // 2. Start loopback SSH server with in-memory SFTP
   const mem = new MemFS()
@@ -502,6 +730,13 @@ async function main() {
     },
     shellData: (chunk) => shellData.push(chunk),
     shellClosed: (event) => shellClosed.push(event)
+  })
+
+  const backupProgress = []
+  const backupManager = new BackupManager({
+    ssh: manager,
+    appVersion: 'e2e',
+    events: { progress: (update) => backupProgress.push({ ...update }) }
   })
 
   const connectInput = {
@@ -645,6 +880,165 @@ async function main() {
   await manager.download(['/site'], outDir)
   check('downloaded tree matches uploaded tree', compareDirs(siteDir, path.join(outDir, 'site')))
 
+  section('backup remote folder with manifest')
+  mem.createFile('/site/.env', Buffer.from('SECRET=1\n'))
+  mem.mkdirAt('/site/empty')
+  mem.createFile('/site/assets/deep.bin', crypto.randomBytes(128 * 1024))
+  const backupRoot = path.join(tmp, 'backups')
+  fs.mkdirSync(backupRoot, { recursive: true })
+  const backupSummary = await backupManager.create({
+    remotePaths: ['/site'],
+    destination: backupRoot,
+    name: 'site-backup'
+  })
+  const backupDir = backupSummary.backupDir
+  const manifestPath = path.join(backupDir, 'backup-manifest.json')
+  check('backup folder and manifest created', fs.existsSync(manifestPath))
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+  check('manifest format/version', manifest.format === 'droplet-files-backup' && manifest.version === 1)
+  check('manifest records the source', manifest.sources[0]?.remotePath === '/site')
+  check('manifest records the default restore parent', manifest.originalDir === '/')
+  check('manifest counts files and directories', manifest.totals.files === 4 && manifest.totals.dirs === 3,
+    `${manifest.totals.files}/${manifest.totals.dirs}`)
+  check('manifest has SHA-256 for every file',
+    manifest.files.every((file) => /^[a-f0-9]{64}$/.test(file.sha256)))
+  check('backup contains the visible file',
+    fs.readFileSync(path.join(backupDir, 'files/site/index.html')).equals(mem.get('/site/index.html').content))
+  check('backup contains a hidden file',
+    fs.readFileSync(path.join(backupDir, 'files/site/.env')).equals(mem.get('/site/.env').content))
+  check('backup contains nested content',
+    fs.readFileSync(path.join(backupDir, 'files/site/assets/deep.bin')).equals(mem.get('/site/assets/deep.bin').content))
+  check('backup recreates empty directories',
+    fs.statSync(path.join(backupDir, 'files/site/empty')).isDirectory())
+  check('backup progress reports done',
+    backupProgress.some((p) => p.kind === 'backup' && p.phase === 'done'))
+
+  section('inspect backup')
+  const inspection = await backupManager.inspect(backupDir)
+  check('inspect resolves the backup folder', path.resolve(inspection.backupDir) === path.resolve(backupDir))
+  check('inspect returns the parsed manifest', inspection.manifest.totals.files === 4)
+
+  section('restore backup (no conflicts)')
+  const restored = await backupManager.restore({
+    backupDir,
+    remoteDir: '/restored',
+    conflictPolicy: 'skip',
+    verifyChecksums: true
+  })
+  check('restore reports all files restored', restored.restored === 4 && restored.failed === 0,
+    JSON.stringify(restored))
+  check('restored file content matches backup',
+    mem.get('/restored/site/index.html')?.content.equals(mem.get('/site/index.html').content))
+  check('restored hidden file exists', mem.get('/restored/site/.env')?.type === 'file')
+  check('restored nested file matches backup',
+    mem.get('/restored/site/assets/deep.bin')?.content.equals(mem.get('/site/assets/deep.bin').content))
+  check('restored empty directory exists', mem.get('/restored/site/empty')?.type === 'dir')
+  check('restore progress reports done',
+    backupProgress.some((p) => p.kind === 'restore' && p.phase === 'done'))
+
+  section('restore conflict policies')
+  mem.get('/restored/site/index.html').content = Buffer.from('keep this original')
+  mem.nodes.delete('/restored/site/.env')
+  mem.nodes.delete('/restored/site/assets/app.css')
+  mem.nodes.delete('/restored/site/assets/deep.bin')
+  const skipConflicts = await backupManager.restore({
+    backupDir,
+    remoteDir: '/restored',
+    conflictPolicy: 'skip',
+    verifyChecksums: true
+  })
+  check('skip leaves existing files alone',
+    skipConflicts.skipped === 1 && skipConflicts.restored === 3 &&
+      mem.get('/restored/site/index.html').content.equals(Buffer.from('keep this original')),
+    JSON.stringify(skipConflicts))
+
+  const overwriteConflicts = await backupManager.restore({
+    backupDir,
+    remoteDir: '/restored',
+    conflictPolicy: 'overwrite',
+    verifyChecksums: true
+  })
+  check('overwrite replaces existing files',
+    overwriteConflicts.restored === 4 && overwriteConflicts.skipped === 0 &&
+      mem.get('/restored/site/index.html').content.equals(mem.get('/site/index.html').content),
+    JSON.stringify(overwriteConflicts))
+
+  const keepBoth = await backupManager.restore({
+    backupDir,
+    remoteDir: '/restored',
+    conflictPolicy: 'keep-both',
+    verifyChecksums: true
+  })
+  check('keep-both renames every conflicting file', keepBoth.renamed === 4, JSON.stringify(keepBoth))
+  check('keep-both preserves the original',
+    mem.get('/restored/site/index.html').content.equals(mem.get('/site/index.html').content))
+  check('keep-both writes suffixed copies',
+    mem.get('/restored/site/index (1).html')?.content.equals(mem.get('/site/index.html').content) &&
+      mem.get('/restored/site/.env (1)')?.type === 'file')
+
+  section('damaged backup is rejected')
+  const damagedDir = path.join(backupRoot, 'damaged')
+  fs.cpSync(backupDir, damagedDir, { recursive: true })
+  const damagedContent = Buffer.from(mem.get('/site/index.html').content)
+  damagedContent[0] ^= 0xff
+  fs.writeFileSync(path.join(damagedDir, 'files/site/index.html'), damagedContent)
+  let damagedError = ''
+  try {
+    await backupManager.restore({
+      backupDir: damagedDir,
+      remoteDir: '/damaged',
+      conflictPolicy: 'skip',
+      verifyChecksums: true
+    })
+  } catch (err) {
+    damagedError = err.message
+  }
+  check('checksum mismatch prevents restore', /Checksum mismatch/.test(damagedError), damagedError)
+  check('nothing was restored before verification finished', !mem.get('/damaged'))
+
+  section('malicious manifest paths are rejected')
+  const tamperedDir = path.join(backupRoot, 'tampered')
+  fs.cpSync(backupDir, tamperedDir, { recursive: true })
+  const tamperedManifestPath = path.join(tamperedDir, 'backup-manifest.json')
+  const tamperedManifest = JSON.parse(fs.readFileSync(tamperedManifestPath, 'utf8'))
+  tamperedManifest.files[0].path = '../escape.txt'
+  fs.writeFileSync(tamperedManifestPath, JSON.stringify(tamperedManifest))
+  let tamperedError = ''
+  try {
+    await backupManager.inspect(tamperedDir)
+  } catch (err) {
+    tamperedError = err.message
+  }
+  check('manifest traversal path is rejected', /invalid file entry/i.test(tamperedError), tamperedError)
+
+  section('restore warns about a different server')
+  const otherHostDir = path.join(backupRoot, 'other-host')
+  fs.cpSync(backupDir, otherHostDir, { recursive: true })
+  const otherHostManifestPath = path.join(otherHostDir, 'backup-manifest.json')
+  const otherHostManifest = JSON.parse(fs.readFileSync(otherHostManifestPath, 'utf8'))
+  otherHostManifest.connection.host = 'other.example.invalid'
+  fs.writeFileSync(otherHostManifestPath, JSON.stringify(otherHostManifest))
+  let hostMismatchError = ''
+  try {
+    await backupManager.restore({
+      backupDir: otherHostDir,
+      remoteDir: '/other-host',
+      conflictPolicy: 'skip',
+      verifyChecksums: true
+    })
+  } catch (err) {
+    hostMismatchError = err.message
+  }
+  check('restore requires confirmation for a different server', /different server/i.test(hostMismatchError), hostMismatchError)
+  const allowedRestore = await backupManager.restore({
+    backupDir: otherHostDir,
+    remoteDir: '/other-host',
+    conflictPolicy: 'skip',
+    verifyChecksums: true,
+    allowHostMismatch: true
+  })
+  check('restore proceeds after explicit confirmation', allowedRestore.restored === 4)
+
   section('single file download')
   await manager.upload([bigPath], '/data')
   await manager.download(['/data/up.bin'], outDir)
@@ -732,6 +1126,7 @@ async function main() {
   manager.lock = new Promise((resolve) => {
     releaseQueuedWork = resolve
   })
+  const staleGeneration = manager.getConnectionGeneration()
   const staleUpload = manager.upload([queuedPath], '/')
   await manager.disconnect()
   await manager.connect(connectInput)
@@ -741,6 +1136,38 @@ async function main() {
   check('queued upload wrote nothing to the reconnected server', !mem.get('/queued-old-session.txt'))
   await manager.lock
   manager.lock = savedLock
+
+  const staleBackupPath = path.join(tmp, 'stale-backup.txt')
+  const staleBackupRejected = await manager
+    .downloadBackupFile('/readme.txt', staleBackupPath, undefined, staleGeneration)
+    .then(() => false, (err) => /Connection changed/.test(err.message))
+  check('backup download is rejected after reconnect', staleBackupRejected)
+  check('stale backup wrote no local file', !fs.existsSync(staleBackupPath))
+
+  let staleMkdirRejected = false
+  try {
+    await manager.mkdirpRemote('/stale-backup-dir', staleGeneration)
+  } catch (err) {
+    staleMkdirRejected = /Connection changed/.test(err.message)
+  }
+  check('restore mkdir is rejected after reconnect', staleMkdirRejected)
+  check('stale restore created no remote directory', !mem.get('/stale-backup-dir'))
+
+  const staleRestorePath = path.join(tmp, 'stale-restore.txt')
+  fs.writeFileSync(staleRestorePath, 'must not be restored')
+  let staleRestoreRejected = false
+  try {
+    await manager.uploadBackupFile(staleRestorePath, '/', 'stale-restore.txt', {
+      policy: 'skip',
+      expectedGeneration: staleGeneration
+    })
+  } catch (err) {
+    staleRestoreRejected = /Connection changed/.test(err.message)
+  }
+  check(
+    'restore upload is rejected after reconnect',
+    staleRestoreRejected && !mem.get('/stale-restore.txt')
+  )
 
   section('disconnect')
   await manager.disconnect()

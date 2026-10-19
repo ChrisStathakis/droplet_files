@@ -42,6 +42,29 @@ const api: ElectronApi = {
   saveProfile: (profile, passphrase) => ipcRenderer.invoke(CH.profilesSave, profile, passphrase),
   deleteProfile: (id) => ipcRenderer.invoke(CH.profilesDelete, id),
 
+  backupCreate: (input) => ipcRenderer.invoke(CH.backupCreate, input),
+  backupInspect: (backupDir) => ipcRenderer.invoke(CH.backupInspect, backupDir),
+  backupRestore: (input) => ipcRenderer.invoke(CH.backupRestore, input),
+  backupCancel: () => ipcRenderer.invoke(CH.backupCancel),
+  backupLastDestination: () => ipcRenderer.invoke(CH.backupLastDestination),
+  pickBackupDestination: () => ipcRenderer.invoke(CH.pickBackupDestination),
+  pickBackupFolder: () => ipcRenderer.invoke(CH.pickBackupFolder),
+  onBackupProgress: onEvent(CH.backupProgress),
+
+  appInfo: () => ipcRenderer.invoke(CH.appInfo),
+  clipboardReadText: () => ipcRenderer.invoke(CH.clipboardReadText),
+  clipboardWriteText: (text) => ipcRenderer.invoke(CH.clipboardWriteText, text),
+
+  actionsList: () => ipcRenderer.invoke(CH.actionsList),
+  actionsSave: (input) => ipcRenderer.invoke(CH.actionsSave, input),
+  actionsDelete: (id) => ipcRenderer.invoke(CH.actionsDelete, id),
+  actionsSetEnabled: (id, enabled) => ipcRenderer.invoke(CH.actionsSetEnabled, id, enabled),
+  actionsRunNow: (id) => ipcRenderer.invoke(CH.actionsRunNow, id),
+  actionsCancelRun: () => ipcRenderer.invoke(CH.actionsCancelRun),
+  actionsDeleteBackup: (runId) => ipcRenderer.invoke(CH.actionsDeleteBackup, runId),
+  actionsOpenFolder: (dir) => ipcRenderer.invoke(CH.actionsOpenFolder, dir),
+  onActionsChanged: onEvent(CH.actionsChanged),
+
   pickKeyFile: () => ipcRenderer.invoke(CH.pickKeyFile),
   getPathForFile: (file) => webUtils.getPathForFile(file)
 }
